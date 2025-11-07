@@ -5,6 +5,7 @@
 ### Step 1: Prepare Your Repository
 
 1. **Make sure your code is on GitHub**:
+
 ```bash
 cd /Users/ahmetbayram/Documents/projects/reports_generation
 git add .
@@ -36,6 +37,7 @@ DASHBOARD_PASSWORD = "your_hashed_password_here"
 ### Step 3: Get Your Password Hash
 
 Run this locally to generate your password hash:
+
 ```bash
 python3 -c "import hashlib; print(hashlib.sha256('YOUR_PASSWORD_HERE'.encode()).hexdigest())"
 ```
@@ -45,6 +47,7 @@ Copy the output and paste it as `DASHBOARD_PASSWORD` in Streamlit secrets.
 ### Step 4: Access Your Dashboard
 
 Your dashboard will be available at:
+
 ```
 https://[your-app-name].streamlit.app
 ```
@@ -101,18 +104,22 @@ https://[your-app-name].streamlit.app
 ## 💡 Important Notes
 
 ### Database Connection
+
 - Make sure your PostgreSQL database allows connections from the hosting platform's IPs
 - Consider using a connection pooler (like PgBouncer) for better performance
 - Use SSL mode for secure connections
 
 ### Streamlit Cloud Limitations
+
 - **Sleep Mode**: App sleeps after 7 days of inactivity
 - **Resources**: 1 GB RAM, 1 CPU core
 - **Build Time**: 10 minutes max
 - **Private Repos**: Requires paid plan
 
 ### Custom Domain
+
 All platforms support custom domains:
+
 - **Streamlit Cloud**: Add in app settings
 - **Render**: Add in dashboard settings
 - **Railway**: Configure in project settings
@@ -122,16 +129,19 @@ All platforms support custom domains:
 ## 🐛 Troubleshooting
 
 ### App won't start
+
 - Check if all secrets are set correctly
 - Verify DATABASE_URL format
 - Check requirements.txt for missing packages
 
 ### Database connection errors
+
 - Verify database allows external connections
 - Check if DATABASE_URL includes SSL mode: `?sslmode=require`
 - Test connection locally first
 
 ### Authentication not working
+
 - Verify password hash is correct
 - Check if username/password are set in secrets
 - Clear browser cookies and try again
@@ -141,6 +151,7 @@ All platforms support custom domains:
 ## 📊 Monitoring
 
 After deployment:
+
 1. Monitor app logs in platform dashboard
 2. Set up uptime monitoring (e.g., UptimeRobot)
 3. Review access logs periodically
@@ -151,6 +162,7 @@ After deployment:
 ## 🎉 You're Done!
 
 Your dashboard is now live and accessible from anywhere with:
+
 - ✅ Secure authentication
 - ✅ Live data from your database
 - ✅ Beautiful visualizations
