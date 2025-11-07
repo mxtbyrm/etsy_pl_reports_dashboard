@@ -1,0 +1,677 @@
+generator client {
+  provider = "prisma-client-py"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PeriodType {
+  YEARLY
+  MONTHLY
+  WEEKLY
+}
+
+model Order {
+  orderId          BigInt    @id @map("order_id")
+  createdTimestamp BigInt    @map("created_timestamp")
+  createdDatetime  DateTime? @map("created_datetime")
+
+  buyerUserId BigInt? @map("buyer_user_id")
+  buyerEmail  String  @map("buyer_email")
+  buyerName   String? @map("buyer_name")
+  country     String? @map("country")
+  address     String? @map("address")
+
+
+  // Financial data - all amounts and their currency info
+  grandTotal             Float?  @map("grand_total")
+  grandTotalDivisor      Float?  @map("grand_total_divisor")
+  grandTotalCurrencyCode String? @map("grand_total_currency_code")
+
+  subtotal             Float?
+  subtotalDivisor      Float?  @map("subtotal_divisor")
+  subtotalCurrencyCode String? @map("subtotal_currency_code")
+
+  totalPrice             Float  @map("total_price")
+  totalPriceDivisor      Float? @map("total_price_divisor")
+  totalPriceCurrencyCode String @map("total_price_currency_code")
+
+  totalShippingCost    Float?  @map("total_shipping_cost")
+  shippingDivisor      Float?  @map("shipping_divisor")
+  shippingCurrencyCode String? @map("shipping_currency_code")
+
+  totalTaxCost    Float?  @map("total_tax_cost")
+  taxDivisor      Float?  @map("tax_divisor")
+  taxCurrencyCode String? @map("tax_currency_code")
+
+  totalVatCost    Float?  @map("total_vat_cost")
+  vatDivisor      Float?  @map("vat_divisor")
+  vatCurrencyCode String? @map("vat_currency_code")
+
+  discountAmt          Float?  @map("discount_amt")
+  discountDivisor      Float?  @map("discount_divisor")
+  discountCurrencyCode String? @map("discount_currency_code")
+
+  giftWrapPrice        Float?  @map("gift_wrap_price")
+  giftWrapDivisor      Float?  @map("gift_wrap_divisor")
+  giftWrapCurrencyCode String? @map("gift_wrap_currency_code")
+
+  // Order status and metadata
+  itemCount     BigInt   @map("item_count")
+  isPaid        Boolean  @map("is_paid")
+  isShipped     Boolean  @map("is_shipped")
+  isGift        Boolean? @map("is_gift")
+  status        String?
+  paymentMethod String?  @map("payment_method")
+
+  // Raw data storage (keep for backup/debugging)
+  rawTransactions String? @map("raw_transactions") // JSON string of all transactions
+  rawShipments    String? @map("raw_shipments") // JSON string of shipment data
+  rawRefunds      String? @map("raw_refunds") // JSON string of refund data
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  transactions OrderTransaction[]
+  shipments    OrderShipment[]
+  refunds      OrderRefund[]
+
+  @@map("orders")
+}
+
+model OrderTransaction {
+  id            BigInt  @id @default(autoincrement())
+  orderId       BigInt  @map("order_id")
+  transactionId BigInt  @unique @map("transaction_id") // Added @unique for Review relation
+  listingId     BigInt? @map("listing_id")
+  productId     BigInt? @map("product_id")
+  sku           String?
+  quantity      Int
+  price         Float
+  priceDivisor  Float?  @map("price_divisor")
+  currencyCode  String  @map("currency_code")
+  shippingCost  Float?  @map("shipping_cost")
+  taxCost       Float?  @map("tax_cost")
+  variationData String? @map("variation_data") // JSON string for variations
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  order          Order           @relation(fields: [orderId], references: [orderId], onDelete: Cascade)
+  listing        Listing?        @relation(fields: [listingId], references: [listingId], onDelete: SetNull, onUpdate: Cascade)
+  listingProduct ListingProduct? @relation(fields: [productId], references: [productId], onDelete: SetNull, onUpdate: Cascade)
+  review         Review? // One-to-one relation with Review
+
+  @@map("order_transactions")
+}
+
+model OrderShipment {
+  id               BigInt  @id @default(autoincrement())
+  orderId          BigInt  @map("order_id")
+  shipmentId       BigInt? @map("shipment_id")
+  carrierName      String? @map("carrier_name")
+  trackingCode     String? @map("tracking_code")
+  trackingUrl      String? @map("tracking_url")
+  shippedTimestamp BigInt? @map("shipped_timestamp")
+  note             String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  order Order @relation(fields: [orderId], references: [orderId], onDelete: Cascade)
+
+  @@map("order_shipments")
+}
+
+model OrderRefund {
+  id               BigInt  @id @default(autoincrement())
+  orderId          BigInt  @map("order_id")
+  refundId         BigInt? @map("refund_id")
+  amount           Float
+  amountDivisor    Float?  @map("amount_divisor")
+  currencyCode     String  @map("currency_code")
+  reason           String?
+  note             String?
+  status           String?
+  createdTimestamp BigInt? @map("created_timestamp")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  order Order @relation(fields: [orderId], references: [orderId], onDelete: Cascade)
+
+  @@map("order_refunds")
+}
+
+model LedgerEntry {
+  entryId          BigInt   @id @map("entry_id")
+  ledgerType       String   @map("ledger_type")
+  amount           Float
+  currency         String
+  createdTimestamp BigInt   @map("created_timestamp")
+  description      String
+  relatedPaymentId BigInt?  @map("related_payment_id")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  @@map("ledger_entries")
+}
+
+model Review {
+  id                BigInt    @id @default(autoincrement())
+  transactionId     BigInt    @unique @map("transaction_id")
+  shopId            BigInt?   @map("shop_id")
+  listingId         BigInt?   @map("listing_id")
+  productId         BigInt?   @map("product_id") // Will be populated from transaction data
+  buyerUserId       BigInt?   @map("buyer_user_id")
+  rating            BigInt    @default(0)
+  reviewMessage     String    @default("") @map("review_message")
+  language          String    @default("")
+  imageUrlFullxfull String    @default("") @map("image_url_fullxfull")
+  createdTimestamp  BigInt?   @map("created_timestamp")
+  updatedTimestamp  BigInt?   @map("updated_timestamp")
+  createdDatetime   DateTime? @map("created_datetime")
+  updatedDatetime   DateTime? @map("updated_datetime")
+
+  // Relations - these will work when listingId and productId are available
+  listing        Listing?        @relation(fields: [listingId], references: [listingId])
+  listingProduct ListingProduct? @relation(fields: [productId], references: [productId])
+
+  // Optional: Add relation to the transaction that this review belongs to
+  transaction OrderTransaction? @relation(fields: [transactionId], references: [transactionId], onDelete: Cascade)
+
+  @@map("reviews")
+}
+
+model Listing {
+  listingId                   BigInt    @id @map("listing_id")
+  userId                      BigInt?   @map("user_id")
+  shopId                      BigInt?   @map("shop_id")
+  title                       String
+  description                 String
+  tags                        String // JSON array
+  materials                   String? // JSON array
+  state                       String
+  price                       Float // Base/minimum price
+  currencyCode                String    @map("currency_code")
+  quantity                    BigInt // Total quantity across all variants
+  views                       BigInt?
+  numFavorers                 BigInt?   @map("num_favorers")
+  creationTimestamp           BigInt    @map("creation_timestamp")
+  creationDatetime            DateTime? @map("creation_datetime")
+  createdTimestamp            BigInt?   @map("created_timestamp")
+  createdDatetime             DateTime? @map("created_datetime")
+  endingTimestamp             BigInt?   @map("ending_timestamp")
+  originalCreationTimestamp   BigInt?   @map("original_creation_timestamp")
+  lastModifiedTimestamp       BigInt?   @map("last_modified_timestamp")
+  lastModifiedDatetime        DateTime? @map("last_modified_datetime")
+  updatedTimestamp            BigInt?   @map("updated_timestamp")
+  updatedDatetime             DateTime? @map("updated_datetime")
+  stateTimestamp              BigInt?   @map("state_timestamp")
+  url                         String
+  shopSectionId               BigInt?   @map("shop_section_id")
+  featuredRank                Int?      @map("featured_rank")
+  nonTaxable                  Boolean?  @map("non_taxable")
+  isTaxable                   Boolean?  @map("is_taxable")
+  isCustomizable              Boolean?  @map("is_customizable")
+  isPersonalizable            Boolean?  @map("is_personalizable")
+  personalizationIsRequired   Boolean?  @map("personalization_is_required")
+  personalizationCharCountMax Int?      @map("personalization_char_count_max")
+  personalizationInstructions String?   @map("personalization_instructions")
+  listingType                 String?   @map("listing_type")
+  shippingProfileId           BigInt?   @map("shipping_profile_id")
+  returnPolicyId              BigInt?   @map("return_policy_id")
+  processingMin               Int?      @map("processing_min")
+  processingMax               Int?      @map("processing_max")
+  whoMade                     String?   @map("who_made")
+  whenMade                    String?   @map("when_made")
+  isSupply                    Boolean?  @map("is_supply")
+  itemWeight                  Float?    @map("item_weight")
+  itemWeightUnit              String?   @map("item_weight_unit")
+  itemLength                  Float?    @map("item_length")
+  itemWidth                   Float?    @map("item_width")
+  itemHeight                  Float?    @map("item_height")
+  itemDimensionsUnit          String?   @map("item_dimensions_unit")
+  isPrivate                   Boolean?  @map("is_private")
+  style                       String? // JSON array
+  fileData                    String?   @map("file_data")
+  hasVariations               Boolean?  @map("has_variations")
+  shouldAutoRenew             Boolean?  @map("should_auto_renew")
+  language                    String?
+  taxonomyId                  BigInt?   @map("taxonomy_id")
+  readinessStateId            BigInt?   @map("readiness_state_id")
+
+  // Inventory control arrays - JSON strings
+  priceOnProperty          String? @map("price_on_property") // JSON array of property IDs
+  quantityOnProperty       String? @map("quantity_on_property") // JSON array of property IDs
+  skuOnProperty            String? @map("sku_on_property") // JSON array of property IDs
+  readinessStateOnProperty String? @map("readiness_state_on_property") // JSON array of property IDs
+
+  // Relationships
+  products     ListingProduct[]
+  transactions OrderTransaction[]
+  reviews      Review[]
+  reports      ListingReport[] // Relation to new report model
+  adStats      ListingAdStat[]
+  visitStats   ListingVisitStat[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("listings")
+}
+
+model ListingProduct {
+  id        BigInt  @id @default(autoincrement())
+  listingId BigInt  @map("listing_id")
+  productId BigInt  @unique @map("product_id")
+  sku       String?
+  isDeleted Boolean @default(false) @map("is_deleted")
+
+  // Relationships
+  listing        Listing                @relation(fields: [listingId], references: [listingId], onDelete: Cascade)
+  offerings      ProductOffering[]
+  propertyValues ProductPropertyValue[]
+  transactions   OrderTransaction[] // Added relation to OrderTransaction
+  reviews        Review[] // Added relation to Review
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([listingId, productId])
+  @@map("listing_products")
+}
+
+model ProductOffering {
+  id               BigInt  @id @default(autoincrement())
+  listingProductId BigInt  @map("listing_product_id")
+  offeringId       BigInt? @map("offering_id")
+  price            Float
+  priceDivisor     Float?  @map("price_divisor")
+  currencyCode     String  @map("currency_code")
+  quantity         Int
+  isEnabled        Boolean @default(true) @map("is_enabled")
+  isDeleted        Boolean @default(false) @map("is_deleted")
+
+  // Relationships
+  listingProduct ListingProduct @relation(fields: [listingProductId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([listingProductId, offeringId])
+  @@map("product_offerings")
+}
+
+model ProductPropertyValue {
+  id               BigInt  @id @default(autoincrement())
+  listingProductId BigInt  @map("listing_product_id")
+  propertyId       BigInt  @map("property_id")
+  propertyName     String? @map("property_name")
+  scaleId          BigInt? @map("scale_id")
+  scaleName        String? @map("scale_name")
+  valueIds         String? @map("value_ids") // JSON array of value IDs
+  values           String? // JSON array of value strings
+
+  // Relationships
+  listingProduct ListingProduct @relation(fields: [listingProductId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([listingProductId, propertyId])
+  @@map("product_property_values")
+}
+
+// --- NEW REPORTING MODELS ---
+
+model ShopReport {
+  id                        BigInt     @id @default(autoincrement())
+  periodType                PeriodType
+  periodStart               DateTime
+  periodEnd                 DateTime
+  periodDays                Int        @default(0)
+  grossRevenue              Float      @default(0)
+  totalRevenue              Float      @default(0)
+  productRevenue            Float      @default(0)
+  totalShippingRevenue      Float      @default(0)
+  totalShippingCharged      Float      @default(0)
+  actualShippingCost        Float      @default(0)
+  shippingProfit            Float      @default(0)
+  dutyAmount                Float      @default(0)
+  taxAmount                 Float      @default(0)
+  fedexProcessingFee        Float      @default(0)
+  totalTaxCollected         Float      @default(0)
+  totalVatCollected         Float      @default(0)
+  totalGiftWrapRevenue      Float      @default(0)
+  totalDiscountsGiven       Float      @default(0)
+  etsyTransactionFees       Float      @default(0)
+  etsyProcessingFees        Float      @default(0)
+  totalEtsyFees             Float      @default(0)
+  etsyFeeRate               Float      @default(0)
+  netRevenue                Float      @default(0)
+  netRevenueAfterRefunds    Float      @default(0)
+  takeHomeRate              Float      @default(0)
+  discountRate              Float      @default(0)
+  contributionMargin        Float      @default(0)
+  totalCost                 Float      @default(0)
+  totalCostWithShipping     Float      @default(0)
+  avgCostPerItem            Float      @default(0)
+  costPerOrder              Float      @default(0)
+  grossProfit               Float      @default(0)
+  grossMargin               Float      @default(0)
+  netProfit                 Float      @default(0)
+  netMargin                 Float      @default(0)
+  returnOnRevenue           Float      @default(0)
+  markupRatio               Float      @default(0)
+  totalOrders               Int        @default(0)
+  totalItems                Int        @default(0)
+  totalQuantitySold         Int        @default(0)
+  uniqueSkus                Int        @default(0)
+  averageOrderValue         Float      @default(0)
+  medianOrderValue          Float      @default(0)
+  percentile75OrderValue    Float      @default(0) @map("percentile_75_order_value")
+  percentile25OrderValue    Float      @default(0) @map("percentile_25_order_value")
+  orderValueStd             Float      @default(0)
+  itemsPerOrder             Float      @default(0)
+  revenuePerItem            Float      @default(0)
+  profitPerItem             Float      @default(0)
+  uniqueCustomers           Int        @default(0)
+  repeatCustomers           Int        @default(0)
+  customerRetentionRate     Float      @default(0)
+  revenuePerCustomer        Float      @default(0)
+  ordersPerCustomer         Float      @default(0)
+  profitPerCustomer         Float      @default(0)
+  shippedOrders             Int        @default(0)
+  shippingRate              Float      @default(0)
+  giftOrders                Int        @default(0)
+  giftRate                  Float      @default(0)
+  avgTimeBetweenOrdersHours Float      @default(0)
+  ordersPerDay              Float      @default(0)
+  revenuePerDay             Float      @default(0)
+  totalRefundAmount         Float      @default(0)
+  totalRefundCount          Int        @default(0)
+  ordersWithRefunds         Int        @default(0)
+  etsyFeesRetainedOnRefunds Float      @default(0)
+  refundRateByOrder         Float      @default(0)
+  refundRateByValue         Float      @default(0)
+  orderRefundRate           Float      @default(0)
+  cancelledOrders           Int        @default(0)
+  cancellationRate          Float      @default(0)
+  completionRate            Float      @default(0)
+  primaryPaymentMethod      String?
+  paymentMethodDiversity    Int        @default(0)
+  customerLifetimeValue     Float      @default(0)
+  paybackPeriodDays         Float      @default(0)
+  customerAcquisitionCost   Float      @default(0)
+  priceElasticity           Float      @default(0)
+  peakMonth                 Int?
+  peakDayOfWeek             Int?
+  peakHour                  Int?
+  seasonalityIndex          Float      @default(0)
+  totalInventory            Int        @default(0)
+  avgPrice                  Float      @default(0)
+  priceRange                Float      @default(0)
+  activeVariants            Int        @default(0)
+  inventoryTurnover         Float      @default(0)
+  stockoutRisk              Float      @default(0)
+  createdAt                 DateTime   @default(now()) @map("created_at")
+
+  @@unique([periodType, periodStart, periodEnd])
+  @@map("shop_reports")
+}
+
+model ListingReport {
+  id                        BigInt     @id @default(autoincrement())
+  listingId                 BigInt
+  listing                   Listing    @relation(fields: [listingId], references: [listingId], onDelete: Cascade)
+  periodType                PeriodType
+  periodStart               DateTime
+  periodEnd                 DateTime
+  periodDays                Int        @default(0)
+  grossRevenue              Float      @default(0)
+  totalRevenue              Float      @default(0)
+  productRevenue            Float      @default(0)
+  totalShippingRevenue      Float      @default(0)
+  totalShippingCharged      Float      @default(0)
+  actualShippingCost        Float      @default(0)
+  shippingProfit            Float      @default(0)
+  dutyAmount                Float      @default(0)
+  taxAmount                 Float      @default(0)
+  fedexProcessingFee        Float      @default(0)
+  totalTaxCollected         Float      @default(0)
+  totalVatCollected         Float      @default(0)
+  totalGiftWrapRevenue      Float      @default(0)
+  totalDiscountsGiven       Float      @default(0)
+  etsyTransactionFees       Float      @default(0)
+  etsyProcessingFees        Float      @default(0)
+  totalEtsyFees             Float      @default(0)
+  etsyFeeRate               Float      @default(0)
+  netRevenue                Float      @default(0)
+  netRevenueAfterRefunds    Float      @default(0)
+  takeHomeRate              Float      @default(0)
+  discountRate              Float      @default(0)
+  contributionMargin        Float      @default(0)
+  totalCost                 Float      @default(0)
+  totalCostWithShipping     Float      @default(0)
+  avgCostPerItem            Float      @default(0)
+  costPerOrder              Float      @default(0)
+  grossProfit               Float      @default(0)
+  grossMargin               Float      @default(0)
+  netProfit                 Float      @default(0)
+  netMargin                 Float      @default(0)
+  returnOnRevenue           Float      @default(0)
+  markupRatio               Float      @default(0)
+  totalOrders               Int        @default(0)
+  totalItems                Int        @default(0)
+  totalQuantitySold         Int        @default(0)
+  uniqueSkus                Int        @default(0)
+  averageOrderValue         Float      @default(0)
+  medianOrderValue          Float      @default(0)
+  percentile75OrderValue    Float      @default(0) @map("percentile_75_order_value")
+  percentile25OrderValue    Float      @default(0) @map("percentile_25_order_value")
+  orderValueStd             Float      @default(0)
+  itemsPerOrder             Float      @default(0)
+  revenuePerItem            Float      @default(0)
+  profitPerItem             Float      @default(0)
+  uniqueCustomers           Int        @default(0)
+  repeatCustomers           Int        @default(0)
+  customerRetentionRate     Float      @default(0)
+  revenuePerCustomer        Float      @default(0)
+  ordersPerCustomer         Float      @default(0)
+  profitPerCustomer         Float      @default(0)
+  shippedOrders             Int        @default(0)
+  shippingRate              Float      @default(0)
+  giftOrders                Int        @default(0)
+  giftRate                  Float      @default(0)
+  avgTimeBetweenOrdersHours Float      @default(0)
+  ordersPerDay              Float      @default(0)
+  revenuePerDay             Float      @default(0)
+  totalRefundAmount         Float      @default(0)
+  totalRefundCount          Int        @default(0)
+  ordersWithRefunds         Int        @default(0)
+  etsyFeesRetainedOnRefunds Float      @default(0)
+  refundRateByOrder         Float      @default(0)
+  refundRateByValue         Float      @default(0)
+  orderRefundRate           Float      @default(0)
+  cancelledOrders           Int        @default(0)
+  cancellationRate          Float      @default(0)
+  completionRate            Float      @default(0)
+  primaryPaymentMethod      String?
+  paymentMethodDiversity    Int        @default(0)
+  customerLifetimeValue     Float      @default(0)
+  paybackPeriodDays         Float      @default(0)
+  customerAcquisitionCost   Float      @default(0)
+  priceElasticity           Float      @default(0)
+  peakMonth                 Int?
+  peakDayOfWeek             Int?
+  peakHour                  Int?
+  seasonalityIndex          Float      @default(0)
+  totalInventory            Int        @default(0)
+  avgPrice                  Float      @default(0)
+  priceRange                Float      @default(0)
+  activeVariants            Int        @default(0)
+  inventoryTurnover         Float      @default(0)
+  stockoutRisk              Float      @default(0)
+  listingViews              Int?       @default(0)
+  listingFavorites          Int?       @default(0)
+  conversionRate            Float?     @default(0)
+  favoriteToOrderRate       Float?     @default(0)
+  viewToFavoriteRate        Float?     @default(0)
+  revenuePerView            Float?     @default(0)
+  profitPerView             Float?     @default(0)
+  costPerAcquisition        Float?     @default(0)
+  shopAvgViews              Float?     @default(0)
+  shopAvgFavorites          Float?     @default(0)
+  viewsVsShopAvg            Float?     @default(0)
+  favoritesVsShopAvg        Float?     @default(0)
+  createdAt                 DateTime   @default(now()) @map("created_at")
+
+  @@unique([listingId, periodType, periodStart, periodEnd])
+  @@map("listing_reports")
+}
+
+model ProductReport {
+  id                        BigInt     @id @default(autoincrement())
+  sku                       String
+  periodType                PeriodType
+  periodStart               DateTime
+  periodEnd                 DateTime
+  periodDays                Int        @default(0)
+  grossRevenue              Float      @default(0)
+  totalRevenue              Float      @default(0)
+  productRevenue            Float      @default(0)
+  totalShippingRevenue      Float      @default(0)
+  totalShippingCharged      Float      @default(0)
+  actualShippingCost        Float      @default(0)
+  shippingProfit            Float      @default(0)
+  dutyAmount                Float      @default(0)
+  taxAmount                 Float      @default(0)
+  fedexProcessingFee        Float      @default(0)
+  totalTaxCollected         Float      @default(0)
+  totalVatCollected         Float      @default(0)
+  totalGiftWrapRevenue      Float      @default(0)
+  totalDiscountsGiven       Float      @default(0)
+  etsyTransactionFees       Float      @default(0)
+  etsyProcessingFees        Float      @default(0)
+  totalEtsyFees             Float      @default(0)
+  etsyFeeRate               Float      @default(0)
+  netRevenue                Float      @default(0)
+  netRevenueAfterRefunds    Float      @default(0)
+  takeHomeRate              Float      @default(0)
+  discountRate              Float      @default(0)
+  contributionMargin        Float      @default(0)
+  totalCost                 Float      @default(0)
+  totalCostWithShipping     Float      @default(0)
+  avgCostPerItem            Float      @default(0)
+  costPerOrder              Float      @default(0)
+  grossProfit               Float      @default(0)
+  grossMargin               Float      @default(0)
+  netProfit                 Float      @default(0)
+  netMargin                 Float      @default(0)
+  returnOnRevenue           Float      @default(0)
+  markupRatio               Float      @default(0)
+  totalOrders               Int        @default(0)
+  totalItems                Int        @default(0)
+  totalQuantitySold         Int        @default(0)
+  uniqueSkus                Int        @default(0)
+  averageOrderValue         Float      @default(0)
+  medianOrderValue          Float      @default(0)
+  percentile75OrderValue    Float      @default(0) @map("percentile_75_order_value")
+  percentile25OrderValue    Float      @default(0) @map("percentile_25_order_value")
+  orderValueStd             Float      @default(0)
+  itemsPerOrder             Float      @default(0)
+  revenuePerItem            Float      @default(0)
+  profitPerItem             Float      @default(0)
+  uniqueCustomers           Int        @default(0)
+  repeatCustomers           Int        @default(0)
+  customerRetentionRate     Float      @default(0)
+  revenuePerCustomer        Float      @default(0)
+  ordersPerCustomer         Float      @default(0)
+  profitPerCustomer         Float      @default(0)
+  shippedOrders             Int        @default(0)
+  shippingRate              Float      @default(0)
+  giftOrders                Int        @default(0)
+  giftRate                  Float      @default(0)
+  avgTimeBetweenOrdersHours Float      @default(0)
+  ordersPerDay              Float      @default(0)
+  revenuePerDay             Float      @default(0)
+  totalRefundAmount         Float      @default(0)
+  totalRefundCount          Int        @default(0)
+  ordersWithRefunds         Int        @default(0)
+  etsyFeesRetainedOnRefunds Float      @default(0)
+  refundRateByOrder         Float      @default(0)
+  refundRateByValue         Float      @default(0)
+  orderRefundRate           Float      @default(0)
+  cancelledOrders           Int        @default(0)
+  cancellationRate          Float      @default(0)
+  completionRate            Float      @default(0)
+  primaryPaymentMethod      String?
+  paymentMethodDiversity    Int        @default(0)
+  customerLifetimeValue     Float      @default(0)
+  paybackPeriodDays         Float      @default(0)
+  customerAcquisitionCost   Float      @default(0)
+  priceElasticity           Float      @default(0)
+  peakMonth                 Int?
+  peakDayOfWeek             Int?
+  peakHour                  Int?
+  seasonalityIndex          Float      @default(0)
+  totalInventory            Int        @default(0)
+  avgPrice                  Float      @default(0)
+  priceRange                Float      @default(0)
+  activeVariants            Int        @default(0)
+  inventoryTurnover         Float      @default(0)
+  stockoutRisk              Float      @default(0)
+  createdAt                 DateTime   @default(now()) @map("created_at")
+
+  @@unique([sku, periodType, periodStart, periodEnd])
+  @@map("product_reports")
+}
+
+model ListingAdStat {
+  id                  BigInt    @id @default(autoincrement())
+  listingId           BigInt    @map("listing_id")
+  listing             Listing   @relation(fields: [listingId], references: [listingId], onDelete: Cascade)
+  periodStart         DateTime  @map("period_start")
+  periodEnd           DateTime  @map("period_end")
+  impressions         BigInt?
+  clicks              BigInt?
+  orders              BigInt?
+  revenue             Float?
+  revenueDivisor      Int?      @map("revenue_divisor")
+  revenueCurrencyCode String?   @map("revenue_currency_code")
+  spend               Float?
+  spendDivisor        Int?      @map("spend_divisor")
+  spendCurrencyCode   String?   @map("spend_currency_code")
+  rawStats            String?   @map("raw_stats")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  @@unique([listingId, periodStart, periodEnd])
+  @@map("listing_ad_stats")
+}
+
+model ListingVisitStat {
+  id          BigInt     @id @default(autoincrement())
+  listingId   BigInt     @map("listing_id")
+  listing     Listing    @relation(fields: [listingId], references: [listingId], onDelete: Cascade)
+  periodType  PeriodType
+  periodStart DateTime   @map("period_start")
+  periodEnd   DateTime   @map("period_end")
+  visits      BigInt?
+  views       BigInt?
+  orders      BigInt?
+  revenue     Float?
+  rawResponse String?    @map("raw_response")
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  @@unique([listingId, periodType, periodStart, periodEnd])
+  @@map("listing_visit_stats")
+}

@@ -1,0 +1,191 @@
+﻿FEDEX;;
+Ülke;Ülke Kodu;Zone
+ABD;US;8
+Afganistan;AF;5
+Almanya;DE;11
+Amerikan Samoa;AS;5
+Andorra;AD;13
+Angola;AO;5
+Anguilla;AI;4
+Antigua ve Barbuda;AG;4
+Arjantin;AR;4
+Arnavutluk;AL;14
+Aruba;AW;4
+Avustralya;AU;7
+Avusturya;AT;11
+Azerbaycan;AZ;3
+Bahamalar;BS;4
+Bahreyn;BH;3
+Bangladeş;BD;3
+Barbados;BB;4
+Belçika;BE;11
+Belize;BZ;4
+Benin;BJ;5
+Bermuda;BM;4
+Beyaz Rusya;BY;14
+Bhutan;BT;3
+Birleşik Arap Emirlikleri;AE;3
+Bolivya;BO;4
+Bosna-Hersek;BA;14
+Botsvana;BW;5
+Brezilya;BR;4
+Bruney;BN;3
+Bulgaristan;BG;10
+Burkina Faso;BF;5
+Burundi;BI;5
+Cayman Adaları;KY;4
+Cebelitarık (GB);GI;14
+Cezayir;DZ;3
+Cibuti;DJ;5
+Cocos Adaları;CC;5
+Cook Adaları;CK;5
+Çad;TD;5
+Çek Cumhuriyeti;CZ;10
+Danimarka;DK;13
+Dominik Cumhuriyeti;DO;4
+Dominika;DM;4
+Ekvador;EC;4
+Ekvator Ginesi;GQ;5
+El Salvador;SV;4
+Endonezya;ID;2
+Eritre;ER;5
+Ermenistan;AM;3
+Estonya;EE;13
+Etiyopya;ET;5
+Faroe Adaları (DK);FO;14
+Fas;MA;3
+Fiji;FJ;5
+Fildişi Sahili;CI;5
+Filipinler;PH;2
+Finlandiya;FI;13
+Fransa;FR;11
+Fransız Guyanası (FR);GF;5
+Fransız Polinezyası (FR);PF;5
+Gabon;GA;5
+Gambiya;GM;5
+Gana;GH;5
+Gine;GN;5
+Gine Bissau;GW;5
+Grenada;GD;4
+Grönland (DK);GL;5
+Guadeloupe (FR);GP;4
+Guam;GU;5
+Guatemala;GT;4
+Guyana;GY;4
+Güney Afrika;ZA;5
+Gürcistan;GE;14
+Haiti;HT;4
+Hırvatistan;HR;13
+Hindistan;IN;3
+Hollanda;NL;11
+Honduras;HN;4
+Hong Kong (CN);HK;6
+Irak;IQ;5
+İngiliz Virjin Adaları;VG;4
+İngiltere;GB;15
+İrlanda;IE;13
+İspanya;ES;12
+İsrail;IL;3
+İsveç;SE;13
+İsviçre;CH;5
+İtalya;IT;11
+İzlanda;IS;14
+Jamaika;JM;4
+Japonya;JP;9
+Kamerun;CM;5
+Kanada;CA;1
+Karadağ;ME;14
+Katar;QA;3
+Kazakistan;KZ;5
+Kenya;KE;5
+Kıbrıs;CY;14
+Kırgızistan;KG;5
+Kiribati;KI;5
+Kolombiya;CO;4
+Kosta Rika;CR;4
+Kuveyt;KW;3
+Kuzey Mariana Adaları;MP;5
+Laos;LA;2
+Lesoto;LS;5
+Letonya;LV;13
+Liberya;LR;5
+Libya;LY;3
+Litvanya;LT;13
+Lübnan;LB;3
+Lüksemburg;LU;11
+Macaristan;HU;10
+Madagaskar;MG;5
+Makedonya;MK;14
+Malavi;MW;5
+Maldivler;MV;5
+Malezya;MY;2
+Mali;ML;5
+Malta;MT;14
+Marshall Adaları;MH;5
+Martinique (FR);MQ;4
+Mauritius;MU;5
+Meksika;MX;4
+Mısır;EG;3
+Mikronezya;FM;5
+Moğolistan;MN;5
+Monako;MC;13
+Montserrat;MS;4
+Moritanya;MR;5
+Mozambik;MZ;5
+Myanmar;MM;5
+Namibya;NA;5
+Nauru;NR;5
+Nepal;NP;3
+Nijer;NE;5
+Nijerya;NG;5
+Nikaragua;NI;4
+Norveç;NO;13
+Orta Afrika Cumhuriyeti;CF;5
+Özbekistan;UZ;5
+Pakistan;PK;3
+Palau;PW;5
+Panama;PA;4
+Papua Yeni Gine;PG;5
+Paraguay;PY;4
+Peru;PE;4
+Polonya;PL;11
+Portekiz;PT;12
+Porto Riko (US);PR;5
+Réunion (FR);RE;5
+Romanya;RO;10
+Ruanda;RW;5
+Saint Lucia;LC;4
+Samoa;WS;5
+San Marino;SM;13
+Senegal;SN;5
+Seyşeller;SC;5
+Sırbistan;RS;13
+Sierra Leone;SL;5
+Singapur;SG;9
+Slovakya Cumhuriyeti;SK;10
+Slovenya;SI;10
+Solomon Adaları;SB;5
+Sri Lanka;LK;3
+Suudi Arabistan;SA;3
+Svaziland;SZ;5
+Şili;CL;4
+Tayland;TH;2
+Tayvan;TW;2
+Togo;TG;5
+Tonga;TO;5
+Trinidad ve Tobago;TT;4
+Tunus;TN;3
+Turks ve Caicos;TC;4
+Tuvalu;TV;5
+Uganda;UG;5
+Ukrayna;UA;14
+Umman;OM;3
+Uruguay;UY;4
+Ürdün;JO;3
+Vanuatu;VU;5
+Venezuela;VE;4
+Vietnam;VN;2
+Virjin Adaları (ABD);VI;4
+Yeni Zelanda;NZ;7
+Yunanistan;GR;10
+Zambiya;ZM;5
