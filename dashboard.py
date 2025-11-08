@@ -233,6 +233,11 @@ class DashboardDataLoader:
         )
         return listings
     
+    async def get_listings_map(self):
+        """Get a dictionary mapping listing IDs to titles"""
+        listings = await self.get_all_listings()
+        return {listing.listingId: listing.title for listing in listings}
+    
     async def get_all_skus(self):
         """Get all unique SKUs"""
         products = await self.prisma.listingproduct.find_many(
@@ -803,8 +808,16 @@ def create_operational_metrics_chart(df: pd.DataFrame):
                [{"type": "scatter"}, {"type": "indicator"}]]
     )
     
+    # Track which subplots have data
+    has_subplot_data = {
+        (1, 1): False,  # Refund analysis
+        (1, 2): False,  # Shipping performance
+        (2, 1): False,  # Inventory metrics
+        (2, 2): True    # Business health (always shown)
+    }
+    
     # Refund analysis
-    if 'refundRateByValue' in df.columns:
+    if 'refundRateByValue' in df.columns and df['refundRateByValue'].sum() > 0:
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
@@ -814,8 +827,9 @@ def create_operational_metrics_chart(df: pd.DataFrame):
             ),
             row=1, col=1
         )
+        has_subplot_data[(1, 1)] = True
     
-    if 'orderRefundRate' in df.columns:
+    if 'orderRefundRate' in df.columns and df['orderRefundRate'].sum() > 0:
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
@@ -825,9 +839,10 @@ def create_operational_metrics_chart(df: pd.DataFrame):
             ),
             row=1, col=1
         )
+        has_subplot_data[(1, 1)] = True
     
     # Shipping performance
-    if 'shippingRate' in df.columns:
+    if 'shippingRate' in df.columns and df['shippingRate'].sum() > 0:
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
@@ -837,8 +852,9 @@ def create_operational_metrics_chart(df: pd.DataFrame):
             ),
             row=1, col=2
         )
+        has_subplot_data[(1, 2)] = True
     
-    if 'completionRate' in df.columns:
+    if 'completionRate' in df.columns and df['completionRate'].sum() > 0:
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
@@ -848,9 +864,10 @@ def create_operational_metrics_chart(df: pd.DataFrame):
             ),
             row=1, col=2
         )
+        has_subplot_data[(1, 2)] = True
     
     # Inventory metrics
-    if 'inventoryTurnover' in df.columns:
+    if 'inventoryTurnover' in df.columns and df['inventoryTurnover'].sum() > 0:
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
@@ -861,8 +878,9 @@ def create_operational_metrics_chart(df: pd.DataFrame):
             ),
             row=2, col=1
         )
+        has_subplot_data[(2, 1)] = True
     
-    if 'stockoutRisk' in df.columns:
+    if 'stockoutRisk' in df.columns and df['stockoutRisk'].sum() > 0:
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
@@ -873,6 +891,7 @@ def create_operational_metrics_chart(df: pd.DataFrame):
             ),
             row=2, col=1
         )
+        has_subplot_data[(2, 1)] = True
     
     # Business health indicator (latest period)
     latest = df.iloc[-1]
@@ -923,12 +942,35 @@ def create_operational_metrics_chart(df: pd.DataFrame):
         row=2, col=2
     )
     
+    # Add "No data" annotations for empty subplots
+    annotations = []
+    subplot_positions = {
+        (1, 1): {'x': 0.225, 'y': 0.85},
+        (1, 2): {'x': 0.775, 'y': 0.85},
+        (2, 1): {'x': 0.225, 'y': 0.35}
+    }
+    
+    for position, has_data in has_subplot_data.items():
+        if not has_data and position in subplot_positions:  # Skip Business Health (2,2)
+            pos = subplot_positions[position]
+            annotations.append(dict(
+                x=pos['x'],
+                y=pos['y'],
+                xref='paper',
+                yref='paper',
+                text='<b>No data available</b><br><i>May indicate no activity in this period</i>',
+                showarrow=False,
+                font=dict(size=12, color='#999'),
+                align='center'
+            ))
+    
     fig.update_layout(
         height=800,
         showlegend=True,
         title_text="Operational Metrics & Business Health",
         title_font_size=24,
-        hovermode='x unified'
+        hovermode='x unified',
+        annotations=annotations
     )
     
     fig.update_xaxes(title_text="Date")
@@ -956,8 +998,16 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
                [{"type": "bar"}, {"type": "scatter"}]]
     )
     
+    # Track which subplots have data
+    has_subplot_data = {
+        (1, 1): False,  # Shipping revenue vs cost
+        (1, 2): False,  # Shipping profit/loss
+        (2, 1): False,  # Shipping cost breakdown
+        (2, 2): False   # Shipping metrics
+    }
+    
     # Shipping revenue vs cost
-    if 'totalShippingCharged' in df.columns:
+    if 'totalShippingCharged' in df.columns and df['totalShippingCharged'].sum() > 0:
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
@@ -968,8 +1018,9 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
             ),
             row=1, col=1
         )
+        has_subplot_data[(1, 1)] = True
     
-    if 'actualShippingCost' in df.columns:
+    if 'actualShippingCost' in df.columns and df['actualShippingCost'].sum() > 0:
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
@@ -979,9 +1030,10 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
             ),
             row=1, col=1
         )
+        has_subplot_data[(1, 1)] = True
     
     # Shipping profit/loss
-    if 'shippingProfit' in df.columns:
+    if 'shippingProfit' in df.columns and (df['shippingProfit'].abs().sum() > 0.01):
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
@@ -993,9 +1045,10 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
             ),
             row=1, col=2
         )
+        has_subplot_data[(1, 2)] = True
     
     # Shipping cost breakdown (stacked)
-    if 'actualShippingCost' in df.columns:
+    if 'actualShippingCost' in df.columns and df['actualShippingCost'].sum() > 0:
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
@@ -1005,8 +1058,9 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
             ),
             row=2, col=1
         )
+        has_subplot_data[(2, 1)] = True
     
-    if 'dutyAmount' in df.columns:
+    if 'dutyAmount' in df.columns and df['dutyAmount'].sum() > 0:
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
@@ -1016,8 +1070,9 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
             ),
             row=2, col=1
         )
+        has_subplot_data[(2, 1)] = True
     
-    if 'taxAmount' in df.columns:
+    if 'taxAmount' in df.columns and df['taxAmount'].sum() > 0:
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
@@ -1027,8 +1082,9 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
             ),
             row=2, col=1
         )
+        has_subplot_data[(2, 1)] = True
     
-    if 'fedexProcessingFee' in df.columns:
+    if 'fedexProcessingFee' in df.columns and df['fedexProcessingFee'].sum() > 0:
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
@@ -1038,9 +1094,10 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
             ),
             row=2, col=1
         )
+        has_subplot_data[(2, 1)] = True
     
     # Shipping metrics
-    if 'shippingRate' in df.columns:
+    if 'shippingRate' in df.columns and df['shippingRate'].sum() > 0:
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
@@ -1051,9 +1108,10 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
             ),
             row=2, col=2
         )
+        has_subplot_data[(2, 2)] = True
     
     # Add average shipping cost per order
-    if 'actualShippingCost' in df.columns and 'totalOrders' in df.columns:
+    if 'actualShippingCost' in df.columns and 'totalOrders' in df.columns and df['actualShippingCost'].sum() > 0:
         avg_ship_per_order = df['actualShippingCost'] / df['totalOrders'].replace(0, 1)
         fig.add_trace(
             go.Scatter(
@@ -1066,6 +1124,30 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
             ),
             row=2, col=2
         )
+        has_subplot_data[(2, 2)] = True
+    
+    # Add "No data" annotations for empty subplots
+    annotations = []
+    subplot_positions = {
+        (1, 1): {'x': 0.225, 'y': 0.85},
+        (1, 2): {'x': 0.775, 'y': 0.85},
+        (2, 1): {'x': 0.225, 'y': 0.35},
+        (2, 2): {'x': 0.775, 'y': 0.35}
+    }
+    
+    for position, has_data in has_subplot_data.items():
+        if not has_data:
+            pos = subplot_positions[position]
+            annotations.append(dict(
+                x=pos['x'],
+                y=pos['y'],
+                xref='paper',
+                yref='paper',
+                text='<b>No data available</b><br><i>Run reportsv4 to calculate shipping costs</i>',
+                showarrow=False,
+                font=dict(size=12, color='#999'),
+                align='center'
+            ))
     
     fig.update_layout(
         height=800,
@@ -1073,7 +1155,8 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
         title_text="Shipping Cost & Profit Analysis",
         title_font_size=24,
         hovermode='x unified',
-        barmode='stack'
+        barmode='stack',
+        annotations=annotations
     )
     
     fig.update_xaxes(title_text="Date")
@@ -1091,7 +1174,7 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
 def create_top_performers_chart(df: pd.DataFrame, metric: str, title: str, n: int = 10):
     """Create top performers chart for listings or products"""
     if df.empty:
-        return go.Figure().add_annotation(text="No data available", showarrow=False)
+        return go.Figure().add_annotation(text="No data available", showarrow=False), pd.DataFrame()
     
     # Group by entity and sum metrics
     if 'listingId' in df.columns:
@@ -1101,19 +1184,27 @@ def create_top_performers_chart(df: pd.DataFrame, metric: str, title: str, n: in
         entity_col = 'sku'
         entity_name = 'SKU'
     else:
-        return go.Figure().add_annotation(text="Invalid data structure", showarrow=False)
+        return go.Figure().add_annotation(text="Invalid data structure", showarrow=False), pd.DataFrame()
     
-    grouped = df.groupby(entity_col).agg({
-        metric: 'sum',
-        'totalOrders': 'sum',
-        'grossRevenue': 'sum',
-        'netProfit': 'sum'
-    }).reset_index()
+    # Aggregate all available numeric columns
+    agg_dict = {metric: 'sum', 'totalOrders': 'sum', 'grossRevenue': 'sum', 'netProfit': 'sum'}
+    
+    # Add other columns if they exist
+    numeric_cols = ['totalItemsSold', 'totalQuantitySold', 'netMargin', 'grossMargin', 
+                    'totalCosts', 'totalEtsyFees', 'totalShippingCost', 'totalShippingCharged']
+    for col in numeric_cols:
+        if col in df.columns and col not in agg_dict:
+            agg_dict[col] = 'sum'
+    
+    grouped = df.groupby(entity_col).agg(agg_dict).reset_index()
     
     # Sort and get top N
     top_performers = grouped.nlargest(n, metric)
     
-    # Convert entity column to string to prevent scientific notation
+    # Store original listingId for data export
+    top_performers_export = top_performers.copy()
+    
+    # Convert entity column to string for display to prevent scientific notation
     if entity_col == 'listingId':
         top_performers[entity_col] = top_performers[entity_col].astype(str)
     
@@ -1156,7 +1247,7 @@ def create_top_performers_chart(df: pd.DataFrame, metric: str, title: str, n: in
         hovermode='closest'
     )
     
-    return fig
+    return fig, top_performers_export
 
 
 def display_key_metrics(df: pd.DataFrame):
@@ -1165,31 +1256,58 @@ def display_key_metrics(df: pd.DataFrame):
         st.warning("No data available for selected period")
         return
     
-    # Get latest period data
-    latest = df.iloc[-1]
+    # Calculate total/aggregated metrics for the entire date range
+    total_gross_revenue = df['grossRevenue'].sum() if 'grossRevenue' in df.columns else 0
+    total_net_profit = df['netProfit'].sum() if 'netProfit' in df.columns else 0
+    total_orders = df['totalOrders'].sum() if 'totalOrders' in df.columns else 0
+    total_unique_customers = df['uniqueCustomers'].sum() if 'uniqueCustomers' in df.columns else 0
     
-    # Calculate period-over-period changes if available
+    # Calculate weighted averages for rates/percentages
+    if 'netMargin' in df.columns and 'grossRevenue' in df.columns:
+        # Weighted average net margin
+        avg_net_margin = (df['netMargin'] * df['grossRevenue']).sum() / df['grossRevenue'].sum() if df['grossRevenue'].sum() > 0 else 0
+    else:
+        avg_net_margin = 0
+    
+    if 'customerRetentionRate' in df.columns and 'uniqueCustomers' in df.columns:
+        # Weighted average retention rate
+        avg_retention = (df['customerRetentionRate'] * df['uniqueCustomers']).sum() / df['uniqueCustomers'].sum() if df['uniqueCustomers'].sum() > 0 else 0
+    else:
+        avg_retention = 0
+    
+    if 'etsyFeeRate' in df.columns and 'grossRevenue' in df.columns:
+        # Weighted average Etsy fee rate
+        avg_etsy_fee_rate = (df['etsyFeeRate'] * df['grossRevenue']).sum() / df['grossRevenue'].sum() if df['grossRevenue'].sum() > 0 else 0
+    else:
+        avg_etsy_fee_rate = 0
+    
+    # Calculate average order value from totals
+    avg_order_value = total_gross_revenue / total_orders if total_orders > 0 else 0
+    
+    # Calculate period-over-period changes by comparing first half vs second half
     if len(df) > 1:
-        previous = df.iloc[-2]
+        mid_point = len(df) // 2
+        first_half = df.iloc[:mid_point]
+        second_half = df.iloc[mid_point:]
         
-        # Safe calculations with column checks
-        if 'grossRevenue' in df.columns:
-            revenue_change = ((latest['grossRevenue'] - previous['grossRevenue']) / previous['grossRevenue'] * 100) if previous['grossRevenue'] > 0 else 0
-        else:
-            revenue_change = 0
-            
-        if 'netProfit' in df.columns:
-            profit_change = ((latest['netProfit'] - previous['netProfit']) / previous['netProfit'] * 100) if previous['netProfit'] > 0 else 0
-        else:
-            profit_change = 0
-            
-        if 'totalOrders' in df.columns:
-            orders_change = ((latest['totalOrders'] - previous['totalOrders']) / previous['totalOrders'] * 100) if previous['totalOrders'] > 0 else 0
-        else:
-            orders_change = 0
-            
-        if 'netMargin' in df.columns:
-            margin_change = (latest['netMargin'] - previous['netMargin']) * 100
+        # Compare sums of each half
+        first_revenue = first_half['grossRevenue'].sum() if 'grossRevenue' in df.columns else 0
+        second_revenue = second_half['grossRevenue'].sum() if 'grossRevenue' in df.columns else 0
+        revenue_change = ((second_revenue - first_revenue) / first_revenue * 100) if first_revenue > 0 else 0
+        
+        first_profit = first_half['netProfit'].sum() if 'netProfit' in df.columns else 0
+        second_profit = second_half['netProfit'].sum() if 'netProfit' in df.columns else 0
+        profit_change = ((second_profit - first_profit) / first_profit * 100) if first_profit > 0 else 0
+        
+        first_orders = first_half['totalOrders'].sum() if 'totalOrders' in df.columns else 0
+        second_orders = second_half['totalOrders'].sum() if 'totalOrders' in df.columns else 0
+        orders_change = ((second_orders - first_orders) / first_orders * 100) if first_orders > 0 else 0
+        
+        # For margin, calculate weighted average for each half
+        if 'netMargin' in df.columns and 'grossRevenue' in df.columns:
+            first_margin = (first_half['netMargin'] * first_half['grossRevenue']).sum() / first_half['grossRevenue'].sum() if first_half['grossRevenue'].sum() > 0 else 0
+            second_margin = (second_half['netMargin'] * second_half['grossRevenue']).sum() / second_half['grossRevenue'].sum() if second_half['grossRevenue'].sum() > 0 else 0
+            margin_change = (second_margin - first_margin) * 100
         else:
             margin_change = 0
     else:
@@ -1202,7 +1320,7 @@ def display_key_metrics(df: pd.DataFrame):
         with col1:
             st.metric(
                 label="💰 Gross Revenue",
-                value=f"${latest['grossRevenue']:,.2f}",
+                value=f"${total_gross_revenue:,.2f}",
                 delta=f"{revenue_change:+.1f}%"
             )
     
@@ -1210,7 +1328,7 @@ def display_key_metrics(df: pd.DataFrame):
         with col2:
             st.metric(
                 label="📈 Net Profit",
-                value=f"${latest['netProfit']:,.2f}",
+                value=f"${total_net_profit:,.2f}",
                 delta=f"{profit_change:+.1f}%"
             )
     
@@ -1218,7 +1336,7 @@ def display_key_metrics(df: pd.DataFrame):
         with col3:
             st.metric(
                 label="🛍️ Total Orders",
-                value=f"{int(latest['totalOrders']):,}",
+                value=f"{int(total_orders):,}",
                 delta=f"{orders_change:+.1f}%"
             )
     
@@ -1226,7 +1344,7 @@ def display_key_metrics(df: pd.DataFrame):
         with col4:
             st.metric(
                 label="💎 Net Margin",
-                value=f"{latest['netMargin']*100:.2f}%",
+                value=f"{avg_net_margin*100:.2f}%",
                 delta=f"{margin_change:+.2f}%"
             )
     
@@ -1237,7 +1355,7 @@ def display_key_metrics(df: pd.DataFrame):
         with col5:
             st.metric(
                 label="👥 Unique Customers",
-                value=f"{int(latest['uniqueCustomers']):,}",
+                value=f"{int(total_unique_customers):,}",
                 delta=None
             )
     
@@ -1245,15 +1363,15 @@ def display_key_metrics(df: pd.DataFrame):
         with col6:
             st.metric(
                 label="🔄 Customer Retention",
-                value=f"{latest['customerRetentionRate']*100:.1f}%",
+                value=f"{avg_retention*100:.1f}%",
                 delta=None
             )
     
-    if 'averageOrderValue' in df.columns:
+    if 'averageOrderValue' in df.columns or (total_orders > 0):
         with col7:
             st.metric(
                 label="📦 Avg Order Value",
-                value=f"${latest['averageOrderValue']:.2f}",
+                value=f"${avg_order_value:.2f}",
                 delta=None
             )
     
@@ -1261,7 +1379,7 @@ def display_key_metrics(df: pd.DataFrame):
         with col8:
             st.metric(
                 label="🎯 Etsy Fee Rate",
-                value=f"{latest['etsyFeeRate']*100:.2f}%",
+                value=f"{avg_etsy_fee_rate*100:.2f}%",
                 delta=None
             )
 
@@ -1322,17 +1440,72 @@ def main():
         # Show info about data availability
         st.sidebar.info(f"📊 Data available from {min_date.date()} to {max_date.date()}")
         
-        # Allow selection up to today to enable preset buttons, will validate after
+        # Allow selection up to today
         from datetime import date as dt_date
+        import calendar
+        from dateutil.relativedelta import relativedelta
+        
         today = dt_date.today()
         
-        date_range = st.sidebar.date_input(
-            "Select date range",
-            value=(min_date.date(), max_date.date()),
-            min_value=min_date.date(),
-            max_value=today,  # Allow up to today for preset buttons
-            help=f"Data is available up to {max_date.date()}. Dates beyond this will be adjusted automatically."
+        # Calculate preset date ranges
+        current_year_start = dt_date(today.year, 1, 1)
+        current_month_start = dt_date(today.year, today.month, 1)
+        
+        # Previous month
+        if today.month == 1:
+            prev_month_start = dt_date(today.year - 1, 12, 1)
+            prev_month_end = dt_date(today.year - 1, 12, 31)
+        else:
+            prev_month_start = dt_date(today.year, today.month - 1, 1)
+            _, last_day = calendar.monthrange(today.year, today.month - 1)
+            prev_month_end = dt_date(today.year, today.month - 1, last_day)
+        
+        # Previous year
+        prev_year_start = dt_date(today.year - 1, 1, 1)
+        prev_year_end = dt_date(today.year - 1, 12, 31)
+        
+        # Last 6 months (from today)
+        six_months_ago = today - relativedelta(months=6)
+        
+        # Date range presets dictionary
+        date_presets = {
+            "This Month": (current_month_start, today),
+            "This Year": (current_year_start, today),
+            "Past Month": (prev_month_start, prev_month_end),
+            "Past Year": (prev_year_start, prev_year_end),
+            "Last 6 Months": (six_months_ago, today),
+            "All Time": (min_date.date(), max_date.date()),
+            "Custom Range": None
+        }
+        
+        # Initialize session state for date preset if not exists
+        if 'date_preset' not in st.session_state:
+            st.session_state.date_preset = "All Time"
+        
+        # Date range preset selection
+        date_preset = st.sidebar.selectbox(
+            "Choose Date Range:",
+            options=list(date_presets.keys()),
+            index=list(date_presets.keys()).index(st.session_state.date_preset),
+            help="Select a preset date range or choose 'Custom Range' to pick specific dates"
         )
+        
+        # Update session state
+        st.session_state.date_preset = date_preset
+        
+        # Set date range based on preset or allow custom selection
+        if date_preset == "Custom Range":
+            date_range = st.sidebar.date_input(
+                "Select custom date range:",
+                value=(min_date.date(), max_date.date()),
+                min_value=min_date.date(),
+                max_value=today,
+                help=f"Data is available up to {max_date.date()}."
+            )
+        else:
+            date_range = date_presets[date_preset]
+            # Show the selected date range
+            st.sidebar.success(f"📅 **{date_range[0]}** to **{date_range[1]}**")
         
         # Handle different date_input return types
         if isinstance(date_range, tuple):
@@ -1595,17 +1768,67 @@ def main():
                         loop.run_until_complete(loader.get_listing_reports(period_type, start_date, end_date))
                     )
                     if not listing_df.empty:
+                        # Get listing titles map
+                        listings_map = loop.run_until_complete(loader.get_listings_map())
+                        
                         col1, col2 = st.columns(2)
                         with col1:
-                            st.plotly_chart(
-                                create_top_performers_chart(listing_df, 'netProfit', 'Top 10 Listings by Net Profit'),
-                                width='stretch'
+                            fig_profit, top_profit_data = create_top_performers_chart(
+                                listing_df, 'netProfit', 'Top 10 Listings by Net Profit'
                             )
+                            st.plotly_chart(fig_profit, use_container_width=True)
+                            
+                            # Add listing titles
+                            if not top_profit_data.empty and 'listingId' in top_profit_data.columns:
+                                top_profit_data['Listing Title'] = top_profit_data['listingId'].map(listings_map)
+                                # Reorder columns to show title first
+                                cols = ['listingId', 'Listing Title'] + [col for col in top_profit_data.columns if col not in ['listingId', 'Listing Title']]
+                                top_profit_data = top_profit_data[cols]
+                                
+                                st.markdown("##### 📊 Top Performers by Net Profit - Data")
+                                # Format for display
+                                display_df = top_profit_data.copy()
+                                display_df.columns = [col.replace('_', ' ').title() if col != 'listingId' else 'Listing ID' for col in display_df.columns]
+                                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                                
+                                # CSV download for this specific chart
+                                csv_profit = top_profit_data.to_csv(index=False)
+                                st.download_button(
+                                    label="📥 Download Top Profit Listings CSV",
+                                    data=csv_profit,
+                                    file_name=f"top_profit_listings_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
+                                    mime="text/csv",
+                                    key="download_profit"
+                                )
+                        
                         with col2:
-                            st.plotly_chart(
-                                create_top_performers_chart(listing_df, 'grossRevenue', 'Top 10 Listings by Revenue'),
-                                width='stretch'
+                            fig_revenue, top_revenue_data = create_top_performers_chart(
+                                listing_df, 'grossRevenue', 'Top 10 Listings by Revenue'
                             )
+                            st.plotly_chart(fig_revenue, use_container_width=True)
+                            
+                            # Add listing titles
+                            if not top_revenue_data.empty and 'listingId' in top_revenue_data.columns:
+                                top_revenue_data['Listing Title'] = top_revenue_data['listingId'].map(listings_map)
+                                # Reorder columns to show title first
+                                cols = ['listingId', 'Listing Title'] + [col for col in top_revenue_data.columns if col not in ['listingId', 'Listing Title']]
+                                top_revenue_data = top_revenue_data[cols]
+                                
+                                st.markdown("##### 📊 Top Performers by Revenue - Data")
+                                # Format for display
+                                display_df = top_revenue_data.copy()
+                                display_df.columns = [col.replace('_', ' ').title() if col != 'listingId' else 'Listing ID' for col in display_df.columns]
+                                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                                
+                                # CSV download for this specific chart
+                                csv_revenue = top_revenue_data.to_csv(index=False)
+                                st.download_button(
+                                    label="📥 Download Top Revenue Listings CSV",
+                                    data=csv_revenue,
+                                    file_name=f"top_revenue_listings_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
+                                    mime="text/csv",
+                                    key="download_revenue"
+                                )
                 
                 elif report_type == "Product Analysis":
                     product_df = convert_reports_to_dataframe(
@@ -1614,39 +1837,130 @@ def main():
                     if not product_df.empty:
                         col1, col2 = st.columns(2)
                         with col1:
-                            st.plotly_chart(
-                                create_top_performers_chart(product_df, 'netProfit', 'Top 10 Products by Net Profit'),
-                                width='stretch'
+                            fig_profit, top_profit_data = create_top_performers_chart(
+                                product_df, 'netProfit', 'Top 10 Products by Net Profit'
                             )
+                            st.plotly_chart(fig_profit, use_container_width=True)
+                            
+                            if not top_profit_data.empty:
+                                st.markdown("##### 📊 Top Products by Net Profit - Data")
+                                # Format for display
+                                display_df = top_profit_data.copy()
+                                display_df.columns = [col.replace('_', ' ').title() for col in display_df.columns]
+                                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                                
+                                # CSV download
+                                csv_profit = top_profit_data.to_csv(index=False)
+                                st.download_button(
+                                    label="📥 Download Top Profit Products CSV",
+                                    data=csv_profit,
+                                    file_name=f"top_profit_products_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
+                                    mime="text/csv",
+                                    key="download_product_profit"
+                                )
+                        
                         with col2:
-                            st.plotly_chart(
-                                create_top_performers_chart(product_df, 'totalQuantitySold', 'Top 10 Products by Units Sold'),
-                                width='stretch'
+                            fig_units, top_units_data = create_top_performers_chart(
+                                product_df, 'totalQuantitySold', 'Top 10 Products by Units Sold'
                             )
+                            st.plotly_chart(fig_units, use_container_width=True)
+                            
+                            if not top_units_data.empty:
+                                st.markdown("##### 📊 Top Products by Units Sold - Data")
+                                # Format for display
+                                display_df = top_units_data.copy()
+                                display_df.columns = [col.replace('_', ' ').title() for col in display_df.columns]
+                                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                                
+                                # CSV download
+                                csv_units = top_units_data.to_csv(index=False)
+                                st.download_button(
+                                    label="📥 Download Top Selling Products CSV",
+                                    data=csv_units,
+                                    file_name=f"top_selling_products_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
+                                    mime="text/csv",
+                                    key="download_product_units"
+                                )
                 else:
                     st.info("Top performers analysis is available in Listing Analysis and Product Analysis views.")
             
             # Download data section
             st.markdown("---")
             st.markdown("## 📥 Download Data")
-            col1, col2 = st.columns(2)
+            
+            # Prepare export dataframe with formatted columns
+            export_df = df.copy()
+            
+            # Format datetime columns
+            if 'periodStart' in export_df.columns:
+                export_df['Period Start'] = export_df['periodStart'].dt.strftime('%Y-%m-%d')
+                export_df = export_df.drop('periodStart', axis=1)
+            
+            if 'periodEnd' in export_df.columns:
+                export_df['Period End'] = export_df['periodEnd'].dt.strftime('%Y-%m-%d')
+                export_df = export_df.drop('periodEnd', axis=1)
+            
+            # Add listing titles if this is listing analysis
+            if report_type == "Listing Analysis" and 'listingId' in export_df.columns:
+                listings_map = loop.run_until_complete(loader.get_listings_map())
+                export_df['Listing Title'] = export_df['listingId'].map(listings_map)
+                # Reorder to put title after listingId
+                cols = export_df.columns.tolist()
+                if 'Listing Title' in cols:
+                    listing_id_idx = cols.index('listingId')
+                    cols.insert(listing_id_idx + 1, cols.pop(cols.index('Listing Title')))
+                    export_df = export_df[cols]
+            
+            # Clean up column names for export
+            export_df.columns = [col.replace('_', ' ').title() if col != 'listingId' else 'Listing ID' for col in export_df.columns]
+            
+            # Round numeric columns to 2 decimal places
+            numeric_cols = export_df.select_dtypes(include=[np.number]).columns
+            export_df[numeric_cols] = export_df[numeric_cols].round(2)
+            
+            st.info(f"📊 Exporting {len(export_df)} records with {len(export_df.columns)} columns")
+            
+            col1, col2, col3 = st.columns(3)
             
             with col1:
-                csv = df.to_csv(index=False)
+                csv = export_df.to_csv(index=False)
                 st.download_button(
-                    label="📊 Download as CSV",
+                    label="📊 Download Full Data as CSV",
                     data=csv,
                     file_name=f"{report_type.lower().replace(' ', '_')}_{period_type.lower()}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
-                    mime="text/csv"
+                    mime="text/csv",
+                    use_container_width=True
                 )
             
             with col2:
                 st.download_button(
-                    label="📋 Download as JSON",
-                    data=df.to_json(orient='records', date_format='iso'),
+                    label="📋 Download Full Data as JSON",
+                    data=export_df.to_json(orient='records', date_format='iso'),
                     file_name=f"{report_type.lower().replace(' ', '_')}_{period_type.lower()}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.json",
-                    mime="application/json"
+                    mime="application/json",
+                    use_container_width=True
                 )
+            
+            with col3:
+                # Excel export option
+                from io import BytesIO
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    export_df.to_excel(writer, index=False, sheet_name='Report Data')
+                excel_data = output.getvalue()
+                
+                st.download_button(
+                    label="📑 Download Full Data as Excel",
+                    data=excel_data,
+                    file_name=f"{report_type.lower().replace(' ', '_')}_{period_type.lower()}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+            
+            # Show preview of export data
+            with st.expander("👁️ Preview Export Data"):
+                st.dataframe(export_df.head(20), use_container_width=True, hide_index=True)
+                st.caption(f"Showing first 20 of {len(export_df)} rows")
         
         else:
             st.warning("⚠️ No data available for the selected filters. Please adjust your selection.")

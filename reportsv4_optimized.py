@@ -19,7 +19,7 @@ import math
 
 # --- Configuration ---
 logging.basicConfig(
-    level=logging.WARNING,  # Reduced to WARNING to show only errors
+    level=logging.INFO,  # Reduced to INFO to show only informational messages
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -91,6 +91,17 @@ class EcommerceAnalyticsOptimized:
         self._skipped_products_no_cost = set()  # Track SKUs skipped due to missing cost data
         self._skipped_count = 0  # Count of reports skipped due to missing costs
         
+        # NEW: Track listing processing statistics
+        self._listings_skipped_no_cost = set()  # Listings skipped due to missing cost data
+        self._listings_processed_with_fallback = set()  # Listings that used fallback costs
+        self._listings_processed_complete = set()  # Listings with 100% cost coverage
+        self._cost_fallback_stats = {
+            "direct": 0,
+            "sibling_same_period": 0,
+            "sibling_historical": 0,
+            "missing": 0
+        }
+        
         # Cache for frequently accessed data
         self._cost_cache = {}
         self._sku_to_products = {}  # SKU -> list of product_ids
@@ -116,6 +127,10 @@ class EcommerceAnalyticsOptimized:
                 return pd.DataFrame()
             
             df = df.dropna(subset=['SKU'])
+            
+            # Add normalized SKU column for fast bidirectional matching
+            df['_normalized_sku'] = df['SKU'].apply(lambda x: self._normalize_sku_for_comparison(str(x)) if pd.notna(x) else '')
+            
             print(f"✓ Loaded cost data: {len(df)} SKUs")
             return df
         except Exception as e:
@@ -272,23 +287,78 @@ class EcommerceAnalyticsOptimized:
         """Removed - not needed in ultra-fast mode."""
         pass
 
+    @staticmethod
+    def _normalize_sku_for_comparison(sku: str) -> str:
+        """
+        Normalize SKU for comparison by removing common prefixes and converting to lowercase.
+        This allows bidirectional matching between database and CSV SKUs.
+        
+        Examples:
+            "OT-WAL-Passport-Wallet-Black" → "wal-passport-wallet-black"
+            "WAL-Passport-Wallet-Black" → "wal-passport-wallet-black"
+            "DELETED-OT-Remote-Organizer" → "remote-organizer"
+            "ot-test-sku" → "test-sku" (handles lowercase prefixes)
+        """
+        if not sku:
+            return sku
+        
+        # Common prefixes to strip (in order of precedence)
+        prefixes_to_remove = [
+            "DELETED-",
+            "OT-",
+            "ZSTK-",
+            "MG-",
+            "LND-",
+            "EU-",
+            "US-",
+            "UK-",
+            "CA-",  # Canada
+            "AU-",  # Australia
+            "JP-",  # Japan
+        ]
+        
+        normalized_sku = sku.strip()
+        
+        # Keep stripping prefixes until none match (handles multiple prefixes)
+        # Compare case-insensitively by checking uppercase version
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes_to_remove:
+                if normalized_sku.upper().startswith(prefix):
+                    normalized_sku = normalized_sku[len(prefix):]
+                    changed = True
+                    break
+        
+        # Convert to lowercase for case-insensitive comparison
+        return normalized_sku.lower()
+
     def _sku_exists_in_cost_csv(self, sku: str) -> bool:
-        """Check if SKU exists in cost CSV at all."""
+        """Check if SKU exists in cost CSV at all using normalized comparison."""
         if not sku or self.cost_data.empty:
             return False
-        lookup_sku = sku.replace("DELETED-", "") if sku.startswith("DELETED-") else sku
-        return not self.cost_data[self.cost_data["SKU"] == lookup_sku].empty
+        
+        normalized_lookup_sku = self._normalize_sku_for_comparison(sku)
+        
+        # Fast lookup using pre-computed normalized column
+        return normalized_lookup_sku in self.cost_data['_normalized_sku'].values
 
     @lru_cache(maxsize=10000)
     def get_cost_for_sku_date(self, sku: str, year: int, month: int) -> float:
-        """Get cost for a specific SKU at a specific date with LRU caching and fallback."""
+        """Get cost for a specific SKU at a specific date with bidirectional normalized matching."""
         if not sku or self.cost_data.empty:
             return 0.0
-            
-        lookup_sku = sku.replace("DELETED-", "") if sku.startswith("DELETED-") else sku
-        sku_row = self.cost_data[self.cost_data["SKU"] == lookup_sku]
-        if sku_row.empty:
+        
+        # Normalize the lookup SKU
+        normalized_lookup_sku = self._normalize_sku_for_comparison(sku)
+        
+        # Fast lookup using pre-computed normalized column
+        matching_rows = self.cost_data[self.cost_data['_normalized_sku'] == normalized_lookup_sku]
+        
+        if matching_rows.empty:
             return 0.0
+        
+        sku_row = matching_rows.iloc[0:1]
 
         month_names = {
             1: "OCAK", 2: "SUBAT", 3: "MART", 4: "NISAN", 5: "MAYIS", 6: "HAZIRAN",
@@ -395,6 +465,228 @@ class EcommerceAnalyticsOptimized:
                 logger.warning(f"⚠️ No cost data found for SKU: {sku} (year: {year}, month: {month})")
         
         return 0.0
+
+    async def get_cost_with_fallback(
+        self, 
+        sku: str, 
+        year: int, 
+        month: int, 
+        listing_id: Optional[int] = None
+    ) -> Tuple[float, str]:
+        """
+        Smart cost lookup with 3-level fallback strategy for product variations.
+        
+        Strategy:
+        1. Try direct cost lookup for this SKU at this specific date
+        2. If missing, try sibling SKUs in same listing (variations) for same period
+        3. If still missing, try most recent historical cost from any sibling
+        4. If still no cost, return 0.0
+        
+        Args:
+            sku: The SKU to get cost for
+            year: Year of the transaction
+            month: Month of the transaction
+            listing_id: Optional listing ID to get sibling SKUs
+            
+        Returns:
+            Tuple of (cost, source) where source is:
+            - "direct" if found directly
+            - "sibling_same_period" if found from sibling at same date
+            - "sibling_historical" if found from sibling's previous cost
+            - "missing" if no cost found
+        """
+        # Level 1: Try direct cost lookup
+        direct_cost = self.get_cost_for_sku_date(sku, year, month)
+        if direct_cost > 0:
+            return (direct_cost, "direct")
+        
+        # If no listing_id provided, can't do fallback
+        if not listing_id:
+            return (0.0, "missing")
+        
+        # Level 2: Try sibling SKUs at same period
+        try:
+            sibling_skus = await self.get_child_skus_for_listing(listing_id)
+            
+            # Remove current SKU from siblings list
+            sibling_skus = [s for s in sibling_skus if s != sku]
+            
+            if sibling_skus:
+                # Try each sibling at the same period
+                for sibling_sku in sibling_skus:
+                    sibling_cost = self.get_cost_for_sku_date(sibling_sku, year, month)
+                    if sibling_cost > 0:
+                        logger.debug(
+                            f"Using sibling SKU cost: {sku} → {sibling_sku} "
+                            f"(${sibling_cost:.2f}) for {year}-{month:02d}"
+                        )
+                        return (sibling_cost, "sibling_same_period")
+                
+                # Level 3: Try historical costs from siblings (most recent first)
+                # Generate list of (year, month) tuples going backwards in time
+                historical_periods = []
+                current_year, current_month = year, month
+                
+                # Go back up to 24 months
+                for _ in range(24):
+                    current_month -= 1
+                    if current_month < 1:
+                        current_month = 12
+                        current_year -= 1
+                    historical_periods.append((current_year, current_month))
+                
+                # Try each historical period for any sibling
+                for hist_year, hist_month in historical_periods:
+                    for sibling_sku in sibling_skus:
+                        hist_cost = self.get_cost_for_sku_date(sibling_sku, hist_year, hist_month)
+                        if hist_cost > 0:
+                            logger.debug(
+                                f"Using historical sibling cost: {sku} → {sibling_sku} "
+                                f"(${hist_cost:.2f}) from {hist_year}-{hist_month:02d} "
+                                f"(needed {year}-{month:02d})"
+                            )
+                            return (hist_cost, "sibling_historical")
+        
+        except Exception as e:
+            logger.error(f"Error in cost fallback for SKU {sku}: {e}")
+        
+        # Level 4: No cost found anywhere
+        return (0.0, "missing")
+
+    async def get_all_costs_for_listing(self, listing_id: int) -> Dict[str, bool]:
+        """
+        Check if a listing has ANY cost data available for its child SKUs.
+        
+        This is used to determine if we should skip the entire listing.
+        
+        Args:
+            listing_id: The listing ID to check
+            
+        Returns:
+            Dict with keys:
+            - has_any_costs: True if at least one SKU has cost data somewhere
+            - skus_with_costs: List of SKUs that have cost data
+            - skus_without_costs: List of SKUs that have NO cost data
+        """
+        try:
+            child_skus = await self.get_child_skus_for_listing(listing_id)
+            
+            if not child_skus:
+                return {
+                    "has_any_costs": False,
+                    "skus_with_costs": [],
+                    "skus_without_costs": []
+                }
+            
+            skus_with_costs = []
+            skus_without_costs = []
+            
+            for sku in child_skus:
+                if self._sku_exists_in_cost_csv(sku):
+                    skus_with_costs.append(sku)
+                else:
+                    skus_without_costs.append(sku)
+            
+            has_any = len(skus_with_costs) > 0
+            
+            return {
+                "has_any_costs": has_any,
+                "skus_with_costs": skus_with_costs,
+                "skus_without_costs": skus_without_costs
+            }
+            
+        except Exception as e:
+            logger.error(f"Error checking costs for listing {listing_id}: {e}")
+            return {
+                "has_any_costs": False,
+                "skus_with_costs": [],
+                "skus_without_costs": []
+            }
+
+    async def _get_listing_id_for_sku(self, sku: str) -> Optional[int]:
+        """
+        Get the listing_id for a given SKU.
+        
+        Args:
+            sku: The SKU to look up
+            
+        Returns:
+            The listing_id if found, None otherwise
+        """
+        try:
+            # Query listing_products table to find the listing for this SKU
+            product = await self.prisma.listingproduct.find_first(
+                where={"sku": sku, "isDeleted": False},
+                include={"listing": True}
+            )
+            
+            if product and product.listing:
+                return product.listing.listingId
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error finding listing for SKU {sku}: {e}")
+            return None
+
+    async def get_ad_spend_for_period(
+        self, 
+        date_range: DateRange, 
+        period_type: str,
+        listing_id: Optional[int] = None
+    ) -> float:
+        """
+        Get total ad spend for a specific period, optionally filtered by listing.
+        
+        Args:
+            date_range: The date range to query
+            period_type: The period type ("yearly", "monthly", or "weekly")
+            listing_id: Optional listing ID to filter by specific listing
+            
+        Returns:
+            Total ad spend in USD for the period
+        """
+        try:
+            # Map period_type string to enum
+            from prisma.enums import PeriodType
+            period_type_enum = {
+                "yearly": PeriodType.YEARLY,
+                "monthly": PeriodType.MONTHLY,
+                "weekly": PeriodType.WEEKLY
+            }.get(period_type.lower())
+            
+            if not period_type_enum:
+                logger.warning(f"Invalid period_type: {period_type}, defaulting to MONTHLY")
+                period_type_enum = PeriodType.MONTHLY
+            
+            query_params = {
+                "where": {
+                    "periodType": period_type_enum,
+                    "periodStart": {"gte": date_range.start_date},
+                    "periodEnd": {"lte": date_range.end_date},
+                }
+            }
+            
+            if listing_id:
+                query_params["where"]["listingId"] = listing_id
+            
+            ad_stats = await self.prisma.listingadstat.find_many(**query_params)
+            
+            total_spend = 0.0
+            for stat in ad_stats:
+                if stat.spend and stat.spendDivisor:
+                    # Convert to actual amount (spend is stored as cents/divisor format)
+                    spend_usd = float(stat.spend) / float(stat.spendDivisor)
+                    total_spend += spend_usd
+                elif stat.spend:
+                    # If no divisor, assume it's already in USD
+                    total_spend += float(stat.spend)
+            
+            return total_spend
+            
+        except Exception as e:
+            logger.error(f"Error fetching ad spend for period {date_range.start_date} to {date_range.end_date}: {e}")
+            return 0.0
 
     @lru_cache(maxsize=5000)
     def get_desi_for_sku(self, sku: str) -> float:
@@ -861,9 +1153,59 @@ class EcommerceAnalyticsOptimized:
             logger.error(f"Error getting listings: {e}", exc_info=True)
             return []
 
+    async def get_child_skus_for_listing(self, listing_id: int) -> List[str]:
+        """
+        Get all child SKUs (product variations) for a specific listing.
+        These are typically color/size variations of the same product.
+        
+        Args:
+            listing_id: The listing ID to get child SKUs for
+            
+        Returns:
+            List of SKU strings (excluding DELETED- prefix)
+        """
+        try:
+            # Check cache first
+            if listing_id in self._listing_to_products:
+                # Get SKUs from cached product IDs
+                skus = []
+                for product_id in self._listing_to_products[listing_id]:
+                    # Find SKU from reverse lookup
+                    for sku, prod_ids in self._sku_to_products.items():
+                        if product_id in prod_ids:
+                            skus.append(sku)
+                            break
+                if skus:
+                    return skus
+            
+            # Query database if not in cache
+            listing_products = await self.prisma.listingproduct.find_many(
+                where={
+                    "listingId": listing_id,
+                    "isDeleted": False,
+                    "sku": {"not": None}
+                }
+            )
+            
+            skus = []
+            for lp in listing_products:
+                if lp.sku:
+                    # Normalize SKU (remove DELETED- prefix)
+                    base_sku = lp.sku.replace("DELETED-", "") if lp.sku.startswith("DELETED-") else lp.sku
+                    if base_sku not in skus:  # Avoid duplicates
+                        skus.append(base_sku)
+            
+            logger.debug(f"Listing {listing_id} has {len(skus)} child SKUs: {skus}")
+            return skus
+            
+        except Exception as e:
+            logger.error(f"Error getting child SKUs for listing {listing_id}: {e}")
+            return []
+
     async def calculate_metrics_batch(
         self, 
         date_ranges: List[DateRange],
+        period_type: str = "monthly",
         listing_id: Optional[int] = None,
         sku: Optional[str] = None
     ) -> Dict[str, Dict]:
@@ -1008,7 +1350,7 @@ class EcommerceAnalyticsOptimized:
             ordered_keys = []
             for period_key, rows in period_results.items():
                 dr = period_keys[period_key]
-                tasks.append(self._calculate_metrics_from_rows(rows, dr, sku, listing_id))
+                tasks.append(self._calculate_metrics_from_rows(rows, dr, period_type, sku, listing_id))
                 ordered_keys.append(period_key)
             
             results = await asyncio.gather(*tasks)
@@ -1032,6 +1374,7 @@ class EcommerceAnalyticsOptimized:
         self, 
         rows: List[Dict], 
         date_range: DateRange,
+        period_type: str = "monthly",
         sku: Optional[str] = None,
         listing_id: Optional[int] = None
     ) -> Dict:
@@ -1137,11 +1480,19 @@ class EcommerceAnalyticsOptimized:
         # Product revenue = net_revenue - shipping charged
         product_revenue = net_revenue_from_sales - total_shipping_charged - total_gift_wrap_revenue
         
-        # Cost calculation with tracking of which items have valid cost data
+        # Cost calculation with NEW fallback strategy and tracking
         total_cost = 0.0
         total_quantity_sold = 0
         total_quantity_with_cost = 0  # Track items that have known costs
         unique_skus = set()
+        
+        # Track cost data sources for reporting
+        cost_sources = {
+            "direct": 0,
+            "sibling_same_period": 0,
+            "sibling_historical": 0,
+            "missing": 0
+        }
         
         # Pre-compute costs for all year-month combinations in this period
         year_month_set = {(date_range.start_date.year, date_range.start_date.month)}
@@ -1165,8 +1516,15 @@ class EcommerceAnalyticsOptimized:
                 sku_val = txn['sku']
                 quantity = int(txn.get('quantity', 0))
                 
-                # Use LRU cached cost lookup
-                cost = self.get_cost_for_sku_date(sku_val, year, month)
+                # Use NEW smart cost lookup with fallback
+                cost, source = await self.get_cost_with_fallback(sku_val, year, month, listing_id)
+                
+                # Track cost source (local)
+                cost_sources[source] += quantity
+                
+                # Track cost source (global statistics)
+                self._cost_fallback_stats[source] += quantity
+                
                 if cost > 0:  # Only count items with valid cost data
                     total_cost += cost * quantity
                     total_quantity_with_cost += quantity
@@ -1175,6 +1533,10 @@ class EcommerceAnalyticsOptimized:
                 
                 normalized_sku = sku_val.replace("DELETED-", "") if sku_val.startswith("DELETED-") else sku_val
                 unique_skus.add(normalized_sku)
+        
+        # Determine if we have complete cost data
+        has_complete_cost_data = (total_quantity_sold > 0 and total_quantity_with_cost == total_quantity_sold)
+        cost_coverage_pct = (total_quantity_with_cost / total_quantity_sold * 100) if total_quantity_sold > 0 else 0
         
         # Calculate average cost only for items with known costs
         avg_cost_per_item = total_cost / total_quantity_with_cost if total_quantity_with_cost > 0 else 0
@@ -1345,10 +1707,55 @@ class EcommerceAnalyticsOptimized:
         # Only the processing fee is refunded. This is an additional cost on refunds.
         etsy_fees_retained_on_refunds = total_refund_amount * self.etsy_transaction_fee_rate
         
-        # ===== NET PROFIT CALCULATION =====
-        # Net Profit = Gross Profit - Refunds - Etsy Fees Retained on Refunds
-        # (After all costs, fees, refunds, AND the Etsy fees you can't get back)
-        net_profit = gross_profit - total_refund_amount - etsy_fees_retained_on_refunds
+        # ===== ADVERTISING SPEND =====
+        # IMPORTANT: Ad spend is at LISTING LEVEL, not SKU level!
+        # Three scenarios:
+        # 1. Shop level (sku=None, listing_id=None): Get all ad spend
+        # 2. Listing level (sku=None, listing_id=X): Get ad spend for that listing
+        # 3. Product level (sku=X): Get proportional share of listing's ad spend
+        total_ad_spend = 0.0
+        
+        if sku is None:
+            # Shop or Listing level - include full ad spend
+            total_ad_spend = await self.get_ad_spend_for_period(date_range, period_type, listing_id=listing_id)
+        else:
+            # Product level - allocate proportionally from listing's ad spend
+            # Need to find which listing this SKU belongs to and get its total revenue
+            try:
+                # Get the listing_id for this SKU
+                product_listing_id = await self._get_listing_id_for_sku(sku)
+                
+                if product_listing_id:
+                    # Get listing's total ad spend
+                    listing_ad_spend = await self.get_ad_spend_for_period(
+                        date_range, period_type, listing_id=product_listing_id
+                    )
+                    
+                    if listing_ad_spend > 0:
+                        # Get listing's total revenue for this period
+                        listing_metrics = await self.calculate_metrics_batch(
+                            [date_range], period_type=period_type, listing_id=product_listing_id
+                        )
+                        
+                        if listing_metrics:
+                            period_key = f"{date_range.start_date.strftime('%Y-%m-%d')}_to_{date_range.end_date.strftime('%Y-%m-%d')}"
+                            listing_data = listing_metrics.get(period_key, {})
+                            listing_revenue = listing_data.get('gross_revenue', 0)
+                            
+                            # Allocate ad spend proportionally by revenue contribution
+                            if listing_revenue > 0 and gross_revenue > 0:
+                                revenue_share = gross_revenue / listing_revenue
+                                total_ad_spend = listing_ad_spend * revenue_share
+                            
+            except Exception as e:
+                logger.debug(f"Could not calculate proportional ad spend for SKU {sku}: {e}")
+                total_ad_spend = 0.0
+        
+        # ===== NET PROFIT CALCULATION (INCLUDING AD SPEND) =====
+        # Net Profit = Gross Profit - Refunds - Etsy Fees Retained on Refunds - Ad Spend
+        # (After all costs, fees, refunds, Etsy fees you can't get back, AND advertising costs)
+        # Note: For products, ad spend is proportionally allocated based on revenue contribution
+        net_profit = gross_profit - total_refund_amount - etsy_fees_retained_on_refunds - total_ad_spend
         
         # Adjusted net revenue (after refunds)
         net_revenue_after_refunds = net_revenue_from_sales - total_refund_amount - etsy_fees_retained_on_refunds
@@ -1417,10 +1824,15 @@ class EcommerceAnalyticsOptimized:
             "contribution_margin": round(contribution_margin, 2),  # Product profit before shipping costs
             "gross_profit": round(gross_profit, 2),  # After COGS, shipping, duties, taxes & Etsy fees
             "gross_margin": round(gross_profit / gross_revenue, 4) if gross_revenue > 0 else 0,
-            "net_profit": round(net_profit, 2),  # After everything including refunds
+            "net_profit": round(net_profit, 2),  # After everything including refunds AND ad spend
             "net_margin": round(net_profit / gross_revenue, 4) if gross_revenue > 0 else 0,
             "return_on_revenue": round(net_profit / gross_revenue, 4) if gross_revenue > 0 else 0,
             "markup_ratio": round(gross_profit / total_cost_with_shipping, 4) if total_cost_with_shipping > 0 else 0,
+            
+            # ===== ADVERTISING METRICS (NEW) =====
+            "total_ad_spend": round(total_ad_spend, 2),  # Total advertising spend for the period
+            "ad_spend_rate": round(total_ad_spend / gross_revenue, 4) if gross_revenue > 0 else 0,  # Ad spend as % of revenue
+            "roas": round(gross_revenue / total_ad_spend, 2) if total_ad_spend > 0 else 0,  # Return on Ad Spend
             
             # ===== ORDER METRICS =====
             "total_orders": total_orders,
@@ -1490,6 +1902,14 @@ class EcommerceAnalyticsOptimized:
             "active_variants": 0,
             "inventory_turnover": 0,
             "stockout_risk": 0,
+            
+            # ===== COST DATA QUALITY METRICS (NEW) =====
+            "has_complete_cost_data": has_complete_cost_data,
+            "cost_coverage_percent": round(cost_coverage_pct, 2),
+            "cost_data_sources": cost_sources.copy(),
+            "items_with_direct_cost": cost_sources["direct"],
+            "items_with_fallback_cost": cost_sources["sibling_same_period"] + cost_sources["sibling_historical"],
+            "items_missing_cost": cost_sources["missing"],
         }
         
         # Get inventory from cache (instant!)
@@ -1515,21 +1935,23 @@ class EcommerceAnalyticsOptimized:
             metrics["inventory_turnover"] = round(inventory_turnover, 4)
             metrics["stockout_risk"] = round(stockout_risk, 4)
         
-        # Log warning if cost data is incomplete
-        if total_quantity_sold > 0 and total_quantity_with_cost < total_quantity_sold:
-            cost_coverage_pct = (total_quantity_with_cost / total_quantity_sold) * 100
+        # Log detailed cost data information
+        if not has_complete_cost_data and total_quantity_sold > 0:
             period_str = f"{date_range.start_date.date()} to {date_range.end_date.date()}"
             entity_str = f"SKU={sku}" if sku else f"Listing={listing_id}" if listing_id else "Shop"
             
-            # Only log periodically to avoid spam (every 10th incomplete period)
+            # Only log periodically to avoid spam
             warning_key = f"{entity_str}_{period_str}"
             if warning_key not in self._cost_coverage_warnings_shown:
                 self._cost_coverage_warnings_shown.add(warning_key)
                 if len(self._cost_coverage_warnings_shown) % 10 == 1:  # Log 1st, 11th, 21st, etc.
-                    logger.warning(
-                        f"⚠️ Incomplete cost data for {entity_str}, period {period_str}: "
-                        f"{total_quantity_with_cost}/{total_quantity_sold} items have costs ({cost_coverage_pct:.1f}% coverage). "
-                        f"Profit metrics may be underestimated."
+                    logger.info(
+                        f"ℹ️ Cost data for {entity_str}, period {period_str}: "
+                        f"{cost_coverage_pct:.1f}% coverage "
+                        f"(direct: {cost_sources['direct']}, "
+                        f"sibling_same: {cost_sources['sibling_same_period']}, "
+                        f"sibling_hist: {cost_sources['sibling_historical']}, "
+                        f"missing: {cost_sources['missing']})"
                     )
         
         return metrics
@@ -1597,6 +2019,13 @@ class EcommerceAnalyticsOptimized:
             # Business
             "customer_lifetime_value": 0, "payback_period_days": 0, "customer_acquisition_cost": 0,
             "price_elasticity": 0,
+            # Cost data quality
+            "has_complete_cost_data": False,
+            "cost_coverage_percent": 0,
+            "cost_data_sources": {"direct": 0, "sibling_same_period": 0, "sibling_historical": 0, "missing": 0},
+            "items_with_direct_cost": 0,
+            "items_with_fallback_cost": 0,
+            "items_missing_cost": 0,
         }
 
     # --- SAVE METHODS (BULK OPTIMIZED) ---
@@ -1806,6 +2235,71 @@ class EcommerceAnalyticsOptimized:
             logger.error(f"Error saving shop report for {period_type} {period_start}-{period_end}: {e}", exc_info=True)
             raise  # Re-raise to see the full error
 
+    async def save_listing_with_products(
+        self, 
+        listing_id: int, 
+        listing_metrics: Dict,
+        product_metrics_list: List[Tuple[str, Dict]],
+        period_type: str,
+        period_start: datetime,
+        period_end: datetime
+    ) -> None:
+        """
+        Save listing report AND all product reports in parallel for better performance.
+        
+        This ensures data consistency and faster saves by batching all related reports.
+        
+        Args:
+            listing_id: The listing ID
+            listing_metrics: Metrics for the listing report
+            product_metrics_list: List of (sku, metrics) tuples for child products
+            period_type: "yearly", "monthly", or "weekly"
+            period_start: Start datetime of the period
+            period_end: End datetime of the period
+        """
+        try:
+            # Prepare all save tasks
+            save_tasks = []
+            
+            # Add listing report save task
+            save_tasks.append(
+                self.save_listing_report(
+                    listing_id, listing_metrics, period_type,
+                    period_start, period_end
+                )
+            )
+            
+            # Add all product report save tasks
+            for sku, product_metrics in product_metrics_list:
+                save_tasks.append(
+                    self.save_product_report(
+                        sku, product_metrics, period_type,
+                        period_start, period_end
+                    )
+                )
+            
+            # Execute all saves in parallel
+            results = await asyncio.gather(*save_tasks, return_exceptions=True)
+            
+            # Check for any errors
+            errors = [r for r in results if isinstance(r, Exception)]
+            if errors:
+                logger.error(
+                    f"Errors saving reports for listing {listing_id}, period {period_type}: "
+                    f"{len(errors)} errors out of {len(save_tasks)} saves"
+                )
+                for error in errors[:3]:  # Log first 3 errors
+                    logger.error(f"  - {error}")
+            else:
+                logger.debug(
+                    f"✓ Saved listing {listing_id} + {len(product_metrics_list)} products "
+                    f"for {period_type} period"
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in batch save for listing {listing_id}: {e}")
+            raise
+
     async def save_listing_report(self, listing_id: int, metrics: Dict, period_type: str,
                                  period_start: datetime, period_end: datetime) -> None:
         """Save listing report to database."""
@@ -1922,6 +2416,10 @@ class EcommerceAnalyticsOptimized:
                 "shopAvgFavorites": self._clean_metric_value(metrics.get("shop_avg_favorites", 0)),
                 "viewsVsShopAvg": self._clean_metric_value(metrics.get("views_vs_shop_avg", 0)),
                 "favoritesVsShopAvg": self._clean_metric_value(metrics.get("favorites_vs_shop_avg", 0)),
+                # Ad spend fields
+                "totalAdSpend": self._clean_metric_value(metrics.get("total_ad_spend", 0)),
+                "adSpendRate": self._clean_metric_value(metrics.get("ad_spend_rate", 0)),
+                "roas": self._clean_metric_value(metrics.get("roas", 0)),
             }
             
             await self.prisma.listingreport.upsert(
@@ -2171,12 +2669,61 @@ class EcommerceAnalyticsOptimized:
             
             print(f"  ✅ Completed all shop reports\n")
             
-            print("✅✅✅ ALL INSIGHTS GENERATED WITH CORRECT HIERARCHY! ✅✅✅\n")
+            # ==========================================
+            # PRINT SUMMARY STATISTICS
+            # ==========================================
+            print("=" * 80)
+            print("📊 COST DATA QUALITY SUMMARY")
+            print("=" * 80)
+            
+            total_listings = len(all_listings)
+            listings_skipped = len(self._listings_skipped_no_cost)
+            listings_processed = total_listings - listings_skipped
+            
+            print(f"\n📋 Listing Processing:")
+            print(f"   Total Listings: {total_listings}")
+            print(f"   ✅ Processed: {listings_processed} ({listings_processed/total_listings*100:.1f}%)")
+            print(f"   ⚠️  Skipped (no cost data): {listings_skipped} ({listings_skipped/total_listings*100:.1f}%)")
+            
+            if self._listings_skipped_no_cost:
+                print(f"\n   Skipped Listing IDs: {sorted(list(self._listings_skipped_no_cost))[:20]}")
+                if len(self._listings_skipped_no_cost) > 20:
+                    print(f"   ... and {len(self._listings_skipped_no_cost) - 20} more")
+            
+            print(f"\n📦 Product/SKU Processing:")
+            print(f"   Total SKUs: {len(all_skus)}")
+            print(f"   SKUs with missing cost data: {len(self._skipped_products_no_cost)}")
+            
+            # Calculate cost data source statistics from metrics
+            total_items = sum(self._cost_fallback_stats.values())
+            if total_items > 0:
+                print(f"\n💰 Cost Data Sources (Total Items: {total_items:,}):")
+                print(f"   Direct lookup: {self._cost_fallback_stats['direct']:,} "
+                      f"({self._cost_fallback_stats['direct']/total_items*100:.1f}%)")
+                print(f"   Sibling (same period): {self._cost_fallback_stats['sibling_same_period']:,} "
+                      f"({self._cost_fallback_stats['sibling_same_period']/total_items*100:.1f}%)")
+                print(f"   Sibling (historical): {self._cost_fallback_stats['sibling_historical']:,} "
+                      f"({self._cost_fallback_stats['sibling_historical']/total_items*100:.1f}%)")
+                print(f"   Missing: {self._cost_fallback_stats['missing']:,} "
+                      f"({self._cost_fallback_stats['missing']/total_items*100:.1f}%)")
+                
+                fallback_items = (self._cost_fallback_stats['sibling_same_period'] + 
+                                 self._cost_fallback_stats['sibling_historical'])
+                print(f"\n   ✨ Fallback Success Rate: {fallback_items:,} items recovered "
+                      f"({fallback_items/total_items*100:.1f}% of total)")
+            
+            print("\n" + "=" * 80)
+            print("✅✅✅ ALL INSIGHTS GENERATED WITH CORRECT HIERARCHY! ✅✅✅")
+            print("=" * 80 + "\n")
+            
             return {
                 "status": "success",
                 "skus": len(all_skus),
                 "listings": len(all_listings),
-                "periods": total_periods
+                "listings_processed": listings_processed,
+                "listings_skipped": listings_skipped,
+                "periods": total_periods,
+                "cost_stats": self._cost_fallback_stats.copy()
             }
             
         except Exception as e:
@@ -2188,7 +2735,7 @@ class EcommerceAnalyticsOptimized:
         async with semaphore:
             try:
                 logger.info(f"  → Processing {period_type.upper()} shop reports...")
-                all_metrics = await self.calculate_metrics_batch(date_ranges)
+                all_metrics = await self.calculate_metrics_batch(date_ranges, period_type=period_type)
                 
                 saved_count = 0
                 for period_key, metrics in all_metrics.items():
@@ -2208,7 +2755,7 @@ class EcommerceAnalyticsOptimized:
         async with semaphore:
             try:
                 for period_type, date_ranges in periods.items():
-                    all_metrics = await self.calculate_metrics_batch(date_ranges, listing_id=listing_id)
+                    all_metrics = await self.calculate_metrics_batch(date_ranges, period_type=period_type, listing_id=listing_id)
                     
                     for period_key, metrics in all_metrics.items():
                         if metrics.get('total_orders', 0) > 0:
@@ -2224,7 +2771,7 @@ class EcommerceAnalyticsOptimized:
         async with semaphore:
             try:
                 for period_type, date_ranges in periods.items():
-                    all_metrics = await self.calculate_metrics_batch(date_ranges, sku=sku)
+                    all_metrics = await self.calculate_metrics_batch(date_ranges, period_type=period_type, sku=sku)
                     
                     for period_key, metrics in all_metrics.items():
                         if metrics.get('total_orders', 0) > 0:
@@ -2253,7 +2800,7 @@ class EcommerceAnalyticsOptimized:
                 
                 cache_store[sku] = {}
                 for period_type, date_ranges in periods.items():
-                    all_metrics = await self.calculate_metrics_batch(date_ranges, sku=sku)
+                    all_metrics = await self.calculate_metrics_batch(date_ranges, period_type=period_type, sku=sku)
                     
                     for period_key, metrics in all_metrics.items():
                         # Check if this SKU has cost data for this specific period
@@ -2275,11 +2822,34 @@ class EcommerceAnalyticsOptimized:
                                                   semaphore: asyncio.Semaphore, 
                                                   sku_metrics_store: Dict, listing_cache_store: Dict):
         """
-        Listing reports - try aggregation from SKUs first, fall back to direct calculation.
-        This ensures all listings get reports even if SKU aggregation fails.
+        Listing reports with cost data validation - SKIP listings with NO cost data.
+        
+        This ensures all listings get reports even if SKU aggregation fails, but
+        SKIPS listings entirely if no cost data exists for any child SKU.
         """
         async with semaphore:
             try:
+                # STEP 1: Check if this listing has ANY cost data available
+                cost_info = await self.get_all_costs_for_listing(listing_id)
+                
+                if not cost_info["has_any_costs"]:
+                    # No cost data found for this listing - SKIP IT
+                    self._listings_skipped_no_cost.add(listing_id)
+                    logger.warning(
+                        f"⚠️ SKIPPING Listing {listing_id}: No cost data found for any child SKUs. "
+                        f"SKUs without costs: {cost_info['skus_without_costs']}"
+                    )
+                    return  # Skip this entire listing
+                
+                # Log if partial cost data
+                if cost_info["skus_without_costs"]:
+                    logger.info(
+                        f"ℹ️ Listing {listing_id}: Partial cost data. "
+                        f"With costs: {cost_info['skus_with_costs']}, "
+                        f"Without costs: {cost_info['skus_without_costs']}"
+                    )
+                
+                # STEP 2: Get child SKUs for aggregation
                 child_product_ids = self._listing_to_products.get(listing_id, [])
                 child_skus = []
                 
@@ -2304,20 +2874,30 @@ class EcommerceAnalyticsOptimized:
                         # TRY 2: If aggregation returned nothing, calculate directly
                         if not aggregated_metrics or aggregated_metrics.get('total_orders', 0) == 0:
                             # Direct calculation for this listing
-                            batch_metrics = await self.calculate_metrics_batch([dr], listing_id=listing_id)
+                            batch_metrics = await self.calculate_metrics_batch([dr], period_type=period_type, listing_id=listing_id)
                             if batch_metrics:
                                 aggregated_metrics = batch_metrics.get(period_key)
                         
-                        # Save if we have valid data
+                        # Save only if we have complete cost data
                         if aggregated_metrics and aggregated_metrics.get('total_orders', 0) > 0:
-                            await self.save_listing_report(
-                                listing_id, 
-                                aggregated_metrics, 
-                                period_type,
-                                aggregated_metrics['period_start'], 
-                                aggregated_metrics['period_end']
-                            )
-                            listing_cache_store[listing_id][full_key] = aggregated_metrics
+                            # Check if cost data is complete enough (at least 50% coverage)
+                            cost_coverage = aggregated_metrics.get('cost_coverage_percent', 0)
+                            has_complete = aggregated_metrics.get('has_complete_cost_data', False)
+                            
+                            if cost_coverage >= 50 or has_complete:
+                                await self.save_listing_report(
+                                    listing_id, 
+                                    aggregated_metrics, 
+                                    period_type,
+                                    aggregated_metrics['period_start'], 
+                                    aggregated_metrics['period_end']
+                                )
+                                listing_cache_store[listing_id][full_key] = aggregated_metrics
+                            else:
+                                logger.debug(
+                                    f"Skipping save for Listing {listing_id}, period {period_type}: "
+                                    f"Cost coverage too low ({cost_coverage:.1f}%)"
+                                )
                             
             except Exception as e:
                 logger.error(f"Error processing listing {listing_id}: {e}", exc_info=True)
@@ -2326,7 +2906,7 @@ class EcommerceAnalyticsOptimized:
         """Fallback for listings without child SKUs."""
         cache_store[listing_id] = {}
         for period_type, date_ranges in periods.items():
-            all_metrics = await self.calculate_metrics_batch(date_ranges, listing_id=listing_id)
+            all_metrics = await self.calculate_metrics_batch(date_ranges, period_type=period_type, listing_id=listing_id)
             for period_key, metrics in all_metrics.items():
                 if metrics.get('total_orders', 0) > 0:
                     await self.save_listing_report(listing_id, metrics, period_type,
@@ -2360,7 +2940,7 @@ class EcommerceAnalyticsOptimized:
                     # TRY 2: If aggregation failed or no data, calculate directly from transactions
                     if not aggregated_metrics or aggregated_metrics.get('total_orders', 0) == 0:
                         # Direct calculation for shop-level (all transactions)
-                        batch_metrics = await self.calculate_metrics_batch([dr])
+                        batch_metrics = await self.calculate_metrics_batch([dr], period_type=period_type)
                         if batch_metrics:
                             # Use the same period_key format that calculate_metrics_batch returns
                             aggregated_metrics = batch_metrics.get(period_key)
@@ -2397,20 +2977,45 @@ class EcommerceAnalyticsOptimized:
 
     def _aggregate_from_listings(self, listing_ids: List[int], period_key: str,
                                 listing_store: Dict, date_range: DateRange) -> Dict:
-        """Aggregate metrics from listings."""
+        """
+        Aggregate metrics from listings.
+        
+        IMPORTANT: Only includes listings with complete cost data to ensure
+        accurate profit calculations at shop level.
+        """
         agg = None
+        skipped_listings = []
+        
         for lid in listing_ids:
             if lid in listing_store and period_key in listing_store[lid]:
-                agg = listing_store[lid][period_key].copy() if agg is None else self._sum_metrics(agg, listing_store[lid][period_key])
+                listing_metrics = listing_store[lid][period_key]
+                
+                # Skip listings without complete cost data
+                if not listing_metrics.get('has_complete_cost_data', False):
+                    skipped_listings.append(lid)
+                    continue
+                
+                agg = listing_metrics.copy() if agg is None else self._sum_metrics(agg, listing_metrics)
+        
+        if skipped_listings:
+            logger.debug(
+                f"Skipped {len(skipped_listings)} listings in shop aggregation "
+                f"due to incomplete cost data for period {period_key}"
+            )
+        
         if agg:
             agg['period_start'], agg['period_end'] = date_range.start_date, date_range.end_date
+            # Mark shop report as having potentially incomplete data if any listings were skipped
+            agg['listings_skipped_no_cost'] = len(skipped_listings)
+            agg['listings_included'] = len(listing_ids) - len(skipped_listings)
+        
         return agg
 
     def _sum_metrics(self, m1: Dict, m2: Dict) -> Dict:
         """Sum metrics for aggregation with corrected Etsy calculations and shipping costs."""
         r = m1.copy()
         
-        # Sum all additive fields (including new shipping fields)
+        # Sum all additive fields (including new shipping fields and cost tracking fields)
         for f in ['gross_revenue', 'total_revenue', 'product_revenue', 'total_shipping_charged', 
                  'total_tax_collected', 'total_vat_collected', 'total_gift_wrap_revenue', 
                  'total_discounts_given', 'etsy_transaction_fees', 'etsy_processing_fees', 
@@ -2421,8 +3026,27 @@ class EcommerceAnalyticsOptimized:
                  'gift_orders', 'total_refund_amount', 'total_refund_count', 'orders_with_refunds', 
                  'etsy_fees_retained_on_refunds',
                  'cancelled_orders', 'unique_customers', 'repeat_customers', 'total_inventory', 
-                 'active_variants']:
+                 'active_variants',
+                 'items_with_direct_cost', 'items_with_fallback_cost', 'items_missing_cost']:
             r[f] = r.get(f, 0) + m2.get(f, 0)
+        
+        # Merge cost data sources
+        if 'cost_data_sources' in m1 and 'cost_data_sources' in m2:
+            r['cost_data_sources'] = {
+                'direct': m1['cost_data_sources'].get('direct', 0) + m2['cost_data_sources'].get('direct', 0),
+                'sibling_same_period': m1['cost_data_sources'].get('sibling_same_period', 0) + m2['cost_data_sources'].get('sibling_same_period', 0),
+                'sibling_historical': m1['cost_data_sources'].get('sibling_historical', 0) + m2['cost_data_sources'].get('sibling_historical', 0),
+                'missing': m1['cost_data_sources'].get('missing', 0) + m2['cost_data_sources'].get('missing', 0)
+            }
+        
+        # Recalculate cost coverage
+        total_items_counted = r.get('items_with_direct_cost', 0) + r.get('items_with_fallback_cost', 0) + r.get('items_missing_cost', 0)
+        if total_items_counted > 0:
+            r['cost_coverage_percent'] = ((r.get('items_with_direct_cost', 0) + r.get('items_with_fallback_cost', 0)) / total_items_counted) * 100
+            r['has_complete_cost_data'] = (r.get('items_missing_cost', 0) == 0)
+        else:
+            r['cost_coverage_percent'] = 0
+            r['has_complete_cost_data'] = False
         
         # Recalculate all derived metrics (rates, margins, averages)
         gross_revenue = r.get('gross_revenue', 0) or r.get('total_revenue', 0)

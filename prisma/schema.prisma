@@ -421,6 +421,9 @@ model ShopReport {
   activeVariants            Int        @default(0)
   inventoryTurnover         Float      @default(0)
   stockoutRisk              Float      @default(0)
+  totalAdSpend              Float      @default(0) @map("total_ad_spend")
+  adSpendRate               Float      @default(0) @map("ad_spend_rate")
+  roas                      Float      @default(0)
   createdAt                 DateTime   @default(now()) @map("created_at")
 
   @@unique([periodType, periodStart, periodEnd])
@@ -531,6 +534,9 @@ model ListingReport {
   shopAvgFavorites          Float?     @default(0)
   viewsVsShopAvg            Float?     @default(0)
   favoritesVsShopAvg        Float?     @default(0)
+  totalAdSpend              Float      @default(0) @map("total_ad_spend")
+  adSpendRate               Float      @default(0) @map("ad_spend_rate")
+  roas                      Float      @default(0)
   createdAt                 DateTime   @default(now()) @map("created_at")
 
   @@unique([listingId, periodType, periodStart, periodEnd])
@@ -635,25 +641,26 @@ model ProductReport {
 }
 
 model ListingAdStat {
-  id                  BigInt    @id @default(autoincrement())
-  listingId           BigInt    @map("listing_id")
-  listing             Listing   @relation(fields: [listingId], references: [listingId], onDelete: Cascade)
-  periodStart         DateTime  @map("period_start")
-  periodEnd           DateTime  @map("period_end")
+  id                  BigInt     @id @default(autoincrement())
+  listingId           BigInt     @map("listing_id")
+  listing             Listing    @relation(fields: [listingId], references: [listingId], onDelete: Cascade)
+  periodType          PeriodType @default(MONTHLY)
+  periodStart         DateTime   @map("period_start")
+  periodEnd           DateTime   @map("period_end")
   impressions         BigInt?
   clicks              BigInt?
   orders              BigInt?
   revenue             Float?
-  revenueDivisor      Int?      @map("revenue_divisor")
-  revenueCurrencyCode String?   @map("revenue_currency_code")
+  revenueDivisor      Int?       @map("revenue_divisor")
+  revenueCurrencyCode String?    @map("revenue_currency_code")
   spend               Float?
-  spendDivisor        Int?      @map("spend_divisor")
-  spendCurrencyCode   String?   @map("spend_currency_code")
-  rawStats            String?   @map("raw_stats")
-  createdAt           DateTime  @default(now()) @map("created_at")
-  updatedAt           DateTime  @updatedAt @map("updated_at")
+  spendDivisor        Int?       @map("spend_divisor")
+  spendCurrencyCode   String?    @map("spend_currency_code")
+  rawStats            String?    @map("raw_stats")
+  createdAt           DateTime   @default(now()) @map("created_at")
+  updatedAt           DateTime   @updatedAt @map("updated_at")
 
-  @@unique([listingId, periodStart, periodEnd])
+  @@unique([listingId, periodType, periodStart, periodEnd])
   @@map("listing_ad_stats")
 }
 
