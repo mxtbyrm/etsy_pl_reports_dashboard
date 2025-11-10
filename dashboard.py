@@ -289,6 +289,19 @@ def convert_reports_to_dataframe(reports):
     if 'listingId' in df.columns:
         df['listingId'] = df['listingId'].astype(str)
     
+    # Debug: Print shipping-related columns and their sums
+    if not df.empty:
+        shipping_cols = ['actualShippingCost', 'shippingProfit', 'dutyAmount', 'taxAmount', 'fedexProcessingFee', 'totalShippingCharged']
+        print(f"\n📊 Loaded {len(df)} records")
+        print(f"� Shipping data summary:")
+        for col in shipping_cols:
+            if col in df.columns:
+                total = df[col].sum()
+                non_zero = (df[col] != 0).sum()
+                print(f"  ✓ {col}: Total=${total:,.2f}, Non-zero records: {non_zero}/{len(df)}")
+            else:
+                print(f"  ✗ {col}: Column not found")
+    
     return df
 
 
@@ -1006,125 +1019,152 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
         (2, 2): False   # Shipping metrics
     }
     
-    # Shipping revenue vs cost
-    if 'totalShippingCharged' in df.columns and df['totalShippingCharged'].sum() > 0:
+    # Shipping revenue vs cost - show even if values are zero to display the structure
+    if 'totalShippingCharged' in df.columns:
+        has_data = df['totalShippingCharged'].sum() > 0
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
                 y=df['totalShippingCharged'],
-                name='Shipping Charged',
+                name='Shipping Charged' + (' (No data)' if not has_data else ''),
                 line=dict(color='#10b981', width=3),
-                fill='tozeroy'
+                fill='tozeroy',
+                opacity=0.3 if not has_data else 1.0
             ),
             row=1, col=1
         )
-        has_subplot_data[(1, 1)] = True
+        if has_data:
+            has_subplot_data[(1, 1)] = True
     
-    if 'actualShippingCost' in df.columns and df['actualShippingCost'].sum() > 0:
+    if 'actualShippingCost' in df.columns:
+        has_data = df['actualShippingCost'].sum() > 0
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
                 y=df['actualShippingCost'],
-                name='Actual Shipping Cost',
-                line=dict(color='#ef4444', width=3)
+                name='Actual Shipping Cost' + (' (No data)' if not has_data else ''),
+                line=dict(color='#ef4444', width=3),
+                opacity=0.3 if not has_data else 1.0
             ),
             row=1, col=1
         )
-        has_subplot_data[(1, 1)] = True
+        if has_data:
+            has_subplot_data[(1, 1)] = True
     
-    # Shipping profit/loss
-    if 'shippingProfit' in df.columns and (df['shippingProfit'].abs().sum() > 0.01):
+    # Shipping profit/loss - show even if zero
+    if 'shippingProfit' in df.columns:
+        has_data = df['shippingProfit'].abs().sum() > 0.01
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
                 y=df['shippingProfit'],
-                name='Shipping Profit',
+                name='Shipping Profit' + (' (All Zero)' if not has_data else ''),
                 marker_color=['#10b981' if x >= 0 else '#ef4444' for x in df['shippingProfit']],
                 text=df['shippingProfit'].round(2),
-                textposition='outside'
+                textposition='outside',
+                opacity=0.3 if not has_data else 1.0
             ),
             row=1, col=2
         )
-        has_subplot_data[(1, 2)] = True
+        if has_data:
+            has_subplot_data[(1, 2)] = True
     
-    # Shipping cost breakdown (stacked)
-    if 'actualShippingCost' in df.columns and df['actualShippingCost'].sum() > 0:
+    # Shipping cost breakdown (stacked) - show structure even if zero
+    if 'actualShippingCost' in df.columns:
+        has_data = df['actualShippingCost'].sum() > 0
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
                 y=df['actualShippingCost'],
-                name='FedEx Charges',
-                marker_color='#667eea'
+                name='FedEx Charges' + (' (Zero)' if not has_data else ''),
+                marker_color='#667eea',
+                opacity=0.3 if not has_data else 1.0
             ),
             row=2, col=1
         )
-        has_subplot_data[(2, 1)] = True
+        if has_data:
+            has_subplot_data[(2, 1)] = True
     
-    if 'dutyAmount' in df.columns and df['dutyAmount'].sum() > 0:
+    if 'dutyAmount' in df.columns:
+        has_data = df['dutyAmount'].sum() > 0
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
                 y=df['dutyAmount'],
-                name='Duty Amount',
-                marker_color='#764ba2'
+                name='Duty Amount' + (' (Zero)' if not has_data else ''),
+                marker_color='#764ba2',
+                opacity=0.3 if not has_data else 1.0
             ),
             row=2, col=1
         )
-        has_subplot_data[(2, 1)] = True
+        if has_data:
+            has_subplot_data[(2, 1)] = True
     
-    if 'taxAmount' in df.columns and df['taxAmount'].sum() > 0:
+    if 'taxAmount' in df.columns:
+        has_data = df['taxAmount'].sum() > 0
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
                 y=df['taxAmount'],
-                name='Import Tax',
-                marker_color='#f59e0b'
+                name='Import Tax' + (' (Zero)' if not has_data else ''),
+                marker_color='#f59e0b',
+                opacity=0.3 if not has_data else 1.0
             ),
             row=2, col=1
         )
-        has_subplot_data[(2, 1)] = True
+        if has_data:
+            has_subplot_data[(2, 1)] = True
     
-    if 'fedexProcessingFee' in df.columns and df['fedexProcessingFee'].sum() > 0:
+    if 'fedexProcessingFee' in df.columns:
+        has_data = df['fedexProcessingFee'].sum() > 0
         fig.add_trace(
             go.Bar(
                 x=df['periodStart'],
                 y=df['fedexProcessingFee'],
-                name='Processing Fee',
-                marker_color='#ef4444'
+                name='Processing Fee' + (' (Zero)' if not has_data else ''),
+                marker_color='#ef4444',
+                opacity=0.3 if not has_data else 1.0
             ),
             row=2, col=1
         )
-        has_subplot_data[(2, 1)] = True
+        if has_data:
+            has_subplot_data[(2, 1)] = True
     
-    # Shipping metrics
-    if 'shippingRate' in df.columns and df['shippingRate'].sum() > 0:
+    # Shipping metrics - show even if zero
+    if 'shippingRate' in df.columns:
+        has_data = df['shippingRate'].sum() > 0
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
                 y=df['shippingRate'] * 100,
-                name='Shipping Rate %',
+                name='Shipping Rate %' + (' (Zero)' if not has_data else ''),
                 line=dict(color='#667eea', width=3),
-                mode='lines+markers'
+                mode='lines+markers',
+                opacity=0.3 if not has_data else 1.0
             ),
             row=2, col=2
         )
-        has_subplot_data[(2, 2)] = True
+        if has_data:
+            has_subplot_data[(2, 2)] = True
     
     # Add average shipping cost per order
-    if 'actualShippingCost' in df.columns and 'totalOrders' in df.columns and df['actualShippingCost'].sum() > 0:
+    if 'actualShippingCost' in df.columns and 'totalOrders' in df.columns:
         avg_ship_per_order = df['actualShippingCost'] / df['totalOrders'].replace(0, 1)
+        has_data = df['actualShippingCost'].sum() > 0
         fig.add_trace(
             go.Scatter(
                 x=df['periodStart'],
                 y=avg_ship_per_order,
-                name='Avg Ship Cost/Order',
+                name='Avg Ship Cost/Order' + (' (Zero)' if not has_data else ''),
                 line=dict(color='#10b981', width=3),
                 mode='lines+markers',
-                yaxis='y2'
+                yaxis='y2',
+                opacity=0.3 if not has_data else 1.0
             ),
             row=2, col=2
         )
-        has_subplot_data[(2, 2)] = True
+        if has_data:
+            has_subplot_data[(2, 2)] = True
     
     # Add "No data" annotations for empty subplots
     annotations = []
@@ -1143,7 +1183,7 @@ def create_shipping_analysis_chart(df: pd.DataFrame):
                 y=pos['y'],
                 xref='paper',
                 yref='paper',
-                text='<b>No data available</b><br><i>Run reportsv4 to calculate shipping costs</i>',
+                text='<b>All values are zero</b><br><i>Shipping costs may not be calculated yet.<br>Check if FedEx data is available in database.</i>',
                 showarrow=False,
                 font=dict(size=12, color='#999'),
                 align='center'
@@ -1482,16 +1522,18 @@ def main():
         if 'date_preset' not in st.session_state:
             st.session_state.date_preset = "All Time"
         
-        # Date range preset selection
+        # Date range preset selection - use key to force rerun on change
         date_preset = st.sidebar.selectbox(
             "Choose Date Range:",
             options=list(date_presets.keys()),
-            index=list(date_presets.keys()).index(st.session_state.date_preset),
+            key="date_preset_selector",
             help="Select a preset date range or choose 'Custom Range' to pick specific dates"
         )
         
-        # Update session state
-        st.session_state.date_preset = date_preset
+        # Check if preset changed and trigger rerun
+        if date_preset != st.session_state.date_preset:
+            st.session_state.date_preset = date_preset
+            st.rerun()
         
         # Set date range based on preset or allow custom selection
         if date_preset == "Custom Range":
@@ -1746,19 +1788,43 @@ def main():
                 
                 # Shipping metrics
                 st.markdown("### 🚚 Shipping Metrics Summary")
-                col1, col2, col3, col4 = st.columns(4)
                 
+                # Check if we have shipping data
                 total_ship_charged = df['totalShippingCharged'].sum() if 'totalShippingCharged' in df.columns else 0
                 total_ship_cost = df['actualShippingCost'].sum() if 'actualShippingCost' in df.columns else 0
                 total_ship_profit = df['shippingProfit'].sum() if 'shippingProfit' in df.columns else 0
+                
+                # Show warning if all shipping data is zero
+                if total_ship_cost == 0 and total_ship_charged > 0:
+                    st.warning("""
+                    ⚠️ **Shipping costs are all zero**
+                    
+                    This means:
+                    - Shipping charges from customers are recorded: ${:,.2f}
+                    - But actual shipping costs (FedEx, duties, taxes) are **not calculated**
+                    
+                    **Possible reasons:**
+                    1. No FedEx shipping data in your database
+                    2. The shipping cost calculation hasn't run yet
+                    3. Reports were generated before shipping calculation was added
+                    
+                    **To fix:** Check if you have data in the `fedex_invoices` or similar shipping tables.
+                    """.format(total_ship_charged))
+                elif total_ship_cost == 0 and total_ship_charged == 0:
+                    st.info("ℹ️ No shipping activity in this period or shipping data not available.")
+                
                 avg_ship_margin = (total_ship_profit / total_ship_charged * 100) if total_ship_charged > 0 else 0
+                
+                col1, col2, col3, col4 = st.columns(4)
                 
                 with col1:
                     st.metric("Total Shipping Charged", f"${total_ship_charged:,.2f}")
                 with col2:
-                    st.metric("Total Shipping Cost", f"${total_ship_cost:,.2f}")
+                    st.metric("Total Shipping Cost", f"${total_ship_cost:,.2f}", 
+                             help="FedEx charges + duties + taxes + processing fees")
                 with col3:
-                    st.metric("Total Shipping Profit", f"${total_ship_profit:,.2f}")
+                    st.metric("Total Shipping Profit", f"${total_ship_profit:,.2f}",
+                             delta=f"{avg_ship_margin:.1f}% margin")
                 with col4:
                     st.metric("Shipping Margin", f"{avg_ship_margin:.2f}%")
             

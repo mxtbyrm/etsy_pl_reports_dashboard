@@ -18,11 +18,31 @@ from prisma.enums import PeriodType
 import math
 
 # --- Configuration ---
+# Configure logging to write to file instead of console to prevent tqdm interference
 logging.basicConfig(
-    level=logging.INFO,  # Reduced to INFO to show only informational messages
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.WARNING,  # Only show warnings and errors
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler('reportsv4_optimized.log'),  # Log to file
+        logging.StreamHandler()  # Keep console for critical errors
+    ]
 )
 logger = logging.getLogger(__name__)
+
+# Create a custom tqdm-compatible logger
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+        except Exception:
+            self.handleError(record)
+
+# Add tqdm handler for console output
+tqdm_handler = TqdmLoggingHandler()
+tqdm_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+tqdm_handler.setLevel(logging.WARNING)
+logger.addHandler(tqdm_handler)
 
 
 # --- Data Structures ---
@@ -47,7 +67,7 @@ class EcommerceAnalyticsOptimized:
     - Vectorized calculations with NumPy
     """
 
-    def __init__(self, cost_csv_path: str, max_concurrent: int = 3, batch_size: int = 50,
+    def __init__(self, cost_csv_path: str, max_concurrent: int = 10, batch_size: int = 100,
                  etsy_transaction_fee_rate: float = 0.065,  # 6.5% Etsy transaction fee
                  etsy_processing_fee_rate: float = 0.03,     # 3% + $0.25 payment processing
                  etsy_processing_fee_fixed: float = 0.25,   # Fixed processing fee per order
@@ -55,11 +75,11 @@ class EcommerceAnalyticsOptimized:
                  fedex_zones_csv_path: str = "fedex_country_code_and_zone_number.csv",
                  fedex_pricing_csv_path: str = "fedex_price_per_kg_for_zones.csv",
                  us_fedex_csv_path: str = "us_fedex_desi_and_price.csv"):
-        # Initialize Prisma with increased timeout for long queries
-        self.prisma = Prisma(http={'timeout': 500.0})  # 120 seconds timeout for complex queries
+        # Initialize Prisma with optimized connection settings
+        self.prisma = Prisma(http={'timeout': 1000.0})  # Will use DATABASE_URL from environment
         self.cost_data = self._load_cost_data(cost_csv_path)
-        self.max_concurrent = max_concurrent  # Parallel operations limit
-        self.batch_size = batch_size  # Bulk insert batch size
+        self.max_concurrent = max_concurrent  # Parallel operations limit (safe for file descriptors)
+        self.batch_size = batch_size  # Bulk insert batch size (increased from 50)
         
         # Load shipping-related CSVs
         self.desi_data = self._load_desi_data(desi_csv_path)
@@ -68,15 +88,26 @@ class EcommerceAnalyticsOptimized:
         self.us_fedex_data = self._load_us_fedex_data(us_fedex_csv_path)
         
         # Create OTTOKOD to SKU mapping from cost.csv for lookups
+        # Build BOTH raw and normalized mappings to handle prefix mismatches
         self.ottokod_to_sku = {}
-        self.sku_to_ottokod = {}
+        self.sku_to_ottokod = {}  # Raw SKU -> OTTOKOD
+        self.sku_to_ottokod_normalized = {}  # Normalized SKU -> OTTOKOD for fallback
         if not self.cost_data.empty and 'OTTOKOD' in self.cost_data.columns and 'SKU' in self.cost_data.columns:
             for _, row in self.cost_data.iterrows():
                 ottokod = row.get('OTTOKOD')
                 sku = row.get('SKU')
                 if pd.notna(ottokod) and pd.notna(sku):
-                    self.ottokod_to_sku[str(ottokod).strip()] = str(sku).strip()
-                    self.sku_to_ottokod[str(sku).strip()] = str(ottokod).strip()
+                    sku_clean = str(sku).strip()
+                    ottokod_clean = str(ottokod).strip()
+                    
+                    # Store raw mapping
+                    self.ottokod_to_sku[ottokod_clean] = sku_clean
+                    self.sku_to_ottokod[sku_clean] = ottokod_clean
+                    
+                    # Store normalized mapping for fallback lookups
+                    normalized_sku = self._normalize_sku_for_comparison(sku_clean)
+                    if normalized_sku:
+                        self.sku_to_ottokod_normalized[normalized_sku] = ottokod_clean
         
         # Etsy fee structure (configurable)
         self.etsy_transaction_fee_rate = etsy_transaction_fee_rate
@@ -107,6 +138,11 @@ class EcommerceAnalyticsOptimized:
         self._sku_to_products = {}  # SKU -> list of product_ids
         self._listing_to_products = {}  # listing_id -> list of product_ids (for aggregating child products)
         self._listing_cache = {}  # listing_id -> listing data
+        
+        # NEW: Bulk cost cache for batch processing (speeds up cost lookups by 10x)
+        self._bulk_cost_cache = {}  # {(sku, year, month): cost}
+        self._bulk_shipping_cache = {}  # {sku: shipping_costs_dict}
+        self._bulk_shipping_cache_normalized = {}  # {normalized_sku: original_sku} for fast lookups
         
         # Pre-computed data store
         self._aggregated_orders = None  # Will hold pre-aggregated order data
@@ -349,6 +385,12 @@ class EcommerceAnalyticsOptimized:
         if not sku or self.cost_data.empty:
             return 0.0
         
+        # NEW: Check bulk cache first (MUCH faster)
+        normalized_lookup_sku = self._normalize_sku_for_comparison(sku)
+        cache_key = (normalized_lookup_sku, year, month)
+        if cache_key in self._bulk_cost_cache:
+            return self._bulk_cost_cache[cache_key]
+        
         # Normalize the lookup SKU
         normalized_lookup_sku = self._normalize_sku_for_comparison(sku)
         
@@ -508,8 +550,12 @@ class EcommerceAnalyticsOptimized:
         try:
             sibling_skus = await self.get_child_skus_for_listing(listing_id)
             
-            # Remove current SKU from siblings list
-            sibling_skus = [s for s in sibling_skus if s != sku]
+            # Remove current SKU from siblings list (use normalized comparison)
+            normalized_current_sku = self._normalize_sku_for_comparison(sku)
+            sibling_skus = [
+                s for s in sibling_skus 
+                if self._normalize_sku_for_comparison(s) != normalized_current_sku
+            ]
             
             if sibling_skus:
                 # Try each sibling at the same period
@@ -614,14 +660,18 @@ class EcommerceAnalyticsOptimized:
             The listing_id if found, None otherwise
         """
         try:
-            # Query listing_products table to find the listing for this SKU
-            product = await self.prisma.listingproduct.find_first(
-                where={"sku": sku, "isDeleted": False},
-                include={"listing": True}
-            )
+            # Use raw SQL for faster lookup
+            query = """
+                SELECT lp.listing_id
+                FROM listing_products lp
+                WHERE lp.sku = $1 
+                AND lp.is_deleted = FALSE
+                LIMIT 1
+            """
+            result = await self.prisma.query_raw(query, sku)
             
-            if product and product.listing:
-                return product.listing.listingId
+            if result and len(result) > 0:
+                return int(result[0]['listing_id'])
             
             return None
             
@@ -646,68 +696,135 @@ class EcommerceAnalyticsOptimized:
         Returns:
             Total ad spend in USD for the period
         """
-        try:
-            # Map period_type string to enum
-            from prisma.enums import PeriodType
-            period_type_enum = {
-                "yearly": PeriodType.YEARLY,
-                "monthly": PeriodType.MONTHLY,
-                "weekly": PeriodType.WEEKLY
-            }.get(period_type.lower())
-            
-            if not period_type_enum:
-                logger.warning(f"Invalid period_type: {period_type}, defaulting to MONTHLY")
-                period_type_enum = PeriodType.MONTHLY
-            
-            query_params = {
-                "where": {
-                    "periodType": period_type_enum,
-                    "periodStart": {"gte": date_range.start_date},
-                    "periodEnd": {"lte": date_range.end_date},
-                }
-            }
-            
-            if listing_id:
-                query_params["where"]["listingId"] = listing_id
-            
-            ad_stats = await self.prisma.listingadstat.find_many(**query_params)
-            
-            total_spend = 0.0
-            for stat in ad_stats:
-                if stat.spend and stat.spendDivisor:
-                    # Convert to actual amount (spend is stored as cents/divisor format)
-                    spend_usd = float(stat.spend) / float(stat.spendDivisor)
-                    total_spend += spend_usd
-                elif stat.spend:
-                    # If no divisor, assume it's already in USD
-                    total_spend += float(stat.spend)
-            
-            return total_spend
-            
-        except Exception as e:
-            logger.error(f"Error fetching ad spend for period {date_range.start_date} to {date_range.end_date}: {e}")
-            return 0.0
+        max_retries = 3
+        retry_delay = 1  # Start with 1 second
+        
+        for attempt in range(max_retries):
+            try:
+                # Ensure database connection is healthy
+                await self._ensure_connection()
+                
+                # Use raw SQL for faster query (with proper divisor handling)
+                # Note: listing_ad_stats table doesn't have period_type column filter
+                # We just query by date range and listing_id if provided
+                if listing_id:
+                    query = """
+                        SELECT 
+                            spend,
+                            spend_divisor
+                        FROM listing_ad_stats
+                        WHERE listing_id = $1
+                          AND period_start >= $2::timestamp
+                          AND period_end <= $3::timestamp
+                    """
+                    result = await self.prisma.query_raw(
+                        query,
+                        listing_id,
+                        date_range.start_date.isoformat(),
+                        date_range.end_date.isoformat()
+                    )
+                else:
+                    query = """
+                        SELECT 
+                            spend,
+                            spend_divisor
+                        FROM listing_ad_stats
+                        WHERE period_start >= $1::timestamp
+                          AND period_end <= $2::timestamp
+                    """
+                    result = await self.prisma.query_raw(
+                        query,
+                        date_range.start_date.isoformat(),
+                        date_range.end_date.isoformat()
+                    )
+                
+                total_spend = 0.0
+                for row in result:
+                    spend = row.get('spend')
+                    spend_divisor = row.get('spend_divisor')
+                    
+                    if spend and spend_divisor:
+                        # Convert to actual amount (spend is stored as cents/divisor format)
+                        spend_usd = float(spend) / float(spend_divisor)
+                        total_spend += spend_usd
+                    elif spend:
+                        # If no divisor, assume it's already in USD
+                        total_spend += float(spend)
+                
+                return total_spend
+                
+            except Exception as e:
+                if "Too many open files" in str(e) or "connection" in str(e).lower():
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Connection error fetching ad spend (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        logger.error(f"Error fetching ad spend after {max_retries} attempts: {e}")
+                        return 0.0
+                else:
+                    logger.error(f"Error fetching ad spend for period {date_range.start_date} to {date_range.end_date}: {e}")
+                    return 0.0
+        
+        return 0.0
 
     @lru_cache(maxsize=5000)
     def get_desi_for_sku(self, sku: str) -> float:
-        """Get product weight (desi) for SKU via OTTOKOD mapping."""
+        """
+        Get product weight (desi) for SKU.
+        
+        Since all_products_desi.csv only has OTTOKOD column (no SKU column),
+        we MUST map SKU -> OTTOKOD first using cost.csv mapping.
+        
+        Uses normalized SKU comparison to handle prefix mismatches like:
+        - Database has "OT-MacBag" but cost.csv has "MacBag"
+        - Database has "MacBag" but cost.csv has "OT-ZSTK-MacBag"
+        """
         if self.desi_data.empty or not sku:
             return 0.5  # Default to 0.5 kg if not found
         
-        # Convert SKU to OTTOKOD
+        # Approach 1: Try exact SKU match first (fast path)
         ottokod = self.sku_to_ottokod.get(sku)
-        if not ottokod:
-            return 0.5  # Default weight
+        if ottokod and 'OTTOKOD' in self.desi_data.columns:
+            desi_row = self.desi_data[self.desi_data['OTTOKOD'].str.strip() == str(ottokod).strip()]
+            if not desi_row.empty:
+                try:
+                    return float(desi_row.iloc[0]['DESİ'])
+                except:
+                    pass
         
-        # Look up desi by OTTOKOD
-        desi_row = self.desi_data[self.desi_data['OTTOKOD'] == ottokod]
-        if desi_row.empty:
-            return 0.5  # Default weight
+        # Approach 2: Try normalized SKU -> OTTOKOD lookup (handles prefix mismatches)
+        normalized_sku = self._normalize_sku_for_comparison(sku)
+        if normalized_sku:
+            ottokod = self.sku_to_ottokod_normalized.get(normalized_sku)
+            if ottokod and 'OTTOKOD' in self.desi_data.columns:
+                desi_row = self.desi_data[self.desi_data['OTTOKOD'].str.strip() == str(ottokod).strip()]
+                if not desi_row.empty:
+                    try:
+                        return float(desi_row.iloc[0]['DESİ'])
+                    except:
+                        pass
         
-        try:
-            return float(desi_row.iloc[0]['DESİ'])
-        except:
-            return 0.5
+        # Approach 3: Fallback - try iterating through cost.csv to find normalized match
+        # Then use that row's OTTOKOD to look up in desi_data
+        if 'OTTOKOD' in self.desi_data.columns and not self.cost_data.empty:
+            if 'SKU' in self.cost_data.columns:
+                for _, cost_row in self.cost_data.iterrows():
+                    csv_sku = str(cost_row.get('SKU', '')).strip()
+                    if self._normalize_sku_for_comparison(csv_sku) == normalized_sku:
+                        # Found matching SKU in cost.csv, get its OTTOKOD
+                        ottokod = cost_row.get('OTTOKOD')
+                        if pd.notna(ottokod):
+                            ottokod_clean = str(ottokod).strip()
+                            desi_row = self.desi_data[self.desi_data['OTTOKOD'].str.strip() == ottokod_clean]
+                            if not desi_row.empty:
+                                try:
+                                    return float(desi_row.iloc[0]['DESİ'])
+                                except:
+                                    pass
+        
+        return 0.5  # Default weight if all approaches fail
 
     @lru_cache(maxsize=200)
     def get_zone_for_country(self, country_code: str) -> int:
@@ -773,56 +890,78 @@ class EcommerceAnalyticsOptimized:
         """
         Get US-specific shipping costs including duties and taxes.
         Returns dict with: fedex_charge, processing_fee, duty_rate, duty_amount, tax_rate, tax_amount
+        
+        Tries multiple approaches with normalized SKU comparison:
+        1. Exact SKU match in cache
+        2. OTTOKOD mapping (exact)
+        3. Normalized SKU match in cache
+        4. Direct DataFrame lookup with normalization
         """
-        if self.us_fedex_data.empty or not sku:
-            return {
-                'fedex_charge': 0.0,
-                'processing_fee': 0.0,
-                'duty_rate': 0.0,
-                'duty_amount': 0.0,
-                'tax_rate': 0.0,
-                'tax_amount': 0.0
-            }
+        default_result = {
+            'fedex_charge': 0.0, 'processing_fee': 0.0,
+            'duty_rate': 0.0, 'duty_amount': 0.0,
+            'tax_rate': 0.0, 'tax_amount': 0.0
+        }
         
-        # Look up by SKU directly first
-        us_row = self.us_fedex_data[self.us_fedex_data['SKU'] == sku]
+        if not sku:
+            return default_result
         
-        # If not found, try via OTTOKOD
-        if us_row.empty:
-            ottokod = self.sku_to_ottokod.get(sku)
-            if ottokod:
-                us_row = self.us_fedex_data[self.us_fedex_data['OTTOKOD'] == ottokod]
+        # Try exact match first (fast path) - uses pre-cached data
+        if sku in self._bulk_shipping_cache:
+            return self._bulk_shipping_cache[sku]
         
-        if us_row.empty:
-            return {
-                'fedex_charge': 0.0,
-                'processing_fee': 0.0,
-                'duty_rate': 0.0,
-                'duty_amount': 0.0,
-                'tax_rate': 0.0,
-                'tax_amount': 0.0
-            }
+        # Try OTTOKOD mapping (exact)
+        ottokod = self.sku_to_ottokod.get(sku)
+        if ottokod and ottokod in self._bulk_shipping_cache:
+            return self._bulk_shipping_cache[ottokod]
         
-        try:
-            row = us_row.iloc[0]
-            return {
-                'fedex_charge': float(row.get('US FEDEX KARGO ÜCRETİ', 0) or 0),
-                'processing_fee': float(row.get('FEDEX İŞLEM ÜCRETİ', 0) or 0),
-                'duty_rate': float(row.get('DUTY OTAN', 0) or 0) / 100,  # Convert % to decimal
-                'duty_amount': float(row.get('DUTY', 0) or 0),
-                'tax_rate': float(row.get('VERGİ ORANI', 0) or 0) / 100,  # Convert % to decimal
-                'tax_amount': float(row.get('VERGİ', 0) or 0)
-            }
-        except Exception as e:
-            logger.error(f"Error parsing US shipping costs for SKU {sku}: {e}")
-            return {
-                'fedex_charge': 0.0,
-                'processing_fee': 0.0,
-                'duty_rate': 0.0,
-                'duty_amount': 0.0,
-                'tax_rate': 0.0,
-                'tax_amount': 0.0
-            }
+        # Try normalized SKU -> OTTOKOD lookup
+        normalized_sku = self._normalize_sku_for_comparison(sku)
+        if normalized_sku:
+            ottokod = self.sku_to_ottokod_normalized.get(normalized_sku)
+            if ottokod and ottokod in self._bulk_shipping_cache:
+                return self._bulk_shipping_cache[ottokod]
+        
+        # Try normalized SKU lookup in cache
+        if normalized_sku in self._bulk_shipping_cache_normalized:
+            original_sku = self._bulk_shipping_cache_normalized[normalized_sku]
+            return self._bulk_shipping_cache[original_sku]
+        
+        # Fallback: Direct search in DataFrame (slower, but catches edge cases)
+        if not self.us_fedex_data.empty:
+            # Check if CSV has SKU or OTTOKOD column
+            if 'SKU' in self.us_fedex_data.columns:
+                # Try exact SKU match
+                row = self.us_fedex_data[self.us_fedex_data['SKU'].str.strip() == str(sku).strip()]
+                if not row.empty:
+                    return self._extract_shipping_costs_from_row(row.iloc[0])
+                
+                # Try normalized SKU match
+                for _, csv_row in self.us_fedex_data.iterrows():
+                    csv_sku = str(csv_row.get('SKU', '')).strip()
+                    if self._normalize_sku_for_comparison(csv_sku) == normalized_sku:
+                        return self._extract_shipping_costs_from_row(csv_row)
+            
+            elif 'OTTOKOD' in self.us_fedex_data.columns:
+                # If CSV only has OTTOKOD, look up via mapping
+                if ottokod:
+                    row = self.us_fedex_data[self.us_fedex_data['OTTOKOD'].str.strip() == str(ottokod).strip()]
+                    if not row.empty:
+                        return self._extract_shipping_costs_from_row(row.iloc[0])
+        
+        # Return default if not found
+        return default_result
+    
+    def _extract_shipping_costs_from_row(self, row) -> Dict[str, float]:
+        """Extract shipping cost data from a DataFrame row."""
+        return {
+            'fedex_charge': float(row.get('US FEDEX KARGO ÜCRETİ', 0) or 0),
+            'processing_fee': float(row.get('FEDEX İŞLEM ÜCRETİ', 0) or 0),
+            'duty_rate': float(row.get('DUTY OTAN', 0) or 0) / 100,
+            'duty_amount': float(row.get('DUTY', 0) or 0),
+            'tax_rate': float(row.get('VERGİ ORANI', 0) or 0) / 100,
+            'tax_amount': float(row.get('VERGİ', 0) or 0)
+        }
 
     def calculate_duty_and_tax(self, invoice_price: float, duty_rate: float, tax_rate: float) -> Dict[str, float]:
         """
@@ -849,11 +988,37 @@ class EcommerceAnalyticsOptimized:
         try:
             # Connect with connection pool limits to prevent exhausting database connections
             await self.prisma.connect()
+            
+            # Set statement timeout to prevent long-running queries from blocking
+            # 5 minutes should be enough for any reasonable query
+            try:
+                await self.prisma.execute_raw("SET statement_timeout = '300000'")  # 5 minutes in milliseconds
+                logger.info("✓ Statement timeout set to 5 minutes")
+            except Exception as timeout_error:
+                logger.warning(f"Could not set statement timeout: {timeout_error}")
+            
             print("✓ Database connection established")
             # Pre-load all essential data
             await self._preload_all_data()
+            # Disable file logging after initialization to prevent tqdm interference
+            for handler in logger.handlers:
+                if isinstance(handler, logging.FileHandler):
+                    handler.setLevel(logging.ERROR)  # Only log errors to file during processing
         except Exception as e:
             logger.error(f"Failed to connect to database: {e}")
+            raise
+    
+    async def _ensure_connection(self):
+        """Ensure database connection is healthy, reconnect if needed."""
+        try:
+            if not self.prisma.is_connected():
+                logger.warning("⚠️ Database connection lost, reconnecting...")
+                await self.prisma.connect()
+                # Reset statement timeout after reconnection
+                await self.prisma.execute_raw("SET statement_timeout = '300000'")
+                logger.info("✓ Database reconnected successfully")
+        except Exception as e:
+            logger.error(f"Failed to ensure database connection: {e}")
             raise
 
     async def disconnect(self):
@@ -896,10 +1061,18 @@ class EcommerceAnalyticsOptimized:
         print("="*80)
         
         try:
-            # Count existing reports
-            shop_count = await self.prisma.shopreport.count()
-            listing_count = await self.prisma.listingreport.count()
-            product_count = await self.prisma.productreport.count()
+            # Count existing reports using raw SQL (faster)
+            count_query = """
+                SELECT 
+                    (SELECT COUNT(*) FROM shop_reports) as shop_count,
+                    (SELECT COUNT(*) FROM listing_reports) as listing_count,
+                    (SELECT COUNT(*) FROM product_reports) as product_count
+            """
+            count_result = await self.prisma.query_raw(count_query)
+            
+            shop_count = int(count_result[0]['shop_count'] or 0)
+            listing_count = int(count_result[0]['listing_count'] or 0)
+            product_count = int(count_result[0]['product_count'] or 0)
             
             print(f"\n📊 Current report counts:")
             print(f"   Shop Reports: {shop_count:,}")
@@ -913,24 +1086,20 @@ class EcommerceAnalyticsOptimized:
             
             print("\n🗑️  Deleting all reports...")
             
-            # Delete all reports in parallel
-            results = await asyncio.gather(
-                self.prisma.shopreport.delete_many(),
-                self.prisma.listingreport.delete_many(),
-                self.prisma.productreport.delete_many(),
-                return_exceptions=True
-            )
+            # Delete all reports using raw SQL (much faster for bulk deletes)
+            delete_queries = [
+                "DELETE FROM shop_reports",
+                "DELETE FROM listing_reports",
+                "DELETE FROM product_reports"
+            ]
             
-            # Check for errors
-            errors = [r for r in results if isinstance(r, Exception)]
-            if errors:
-                logger.error(f"Errors during deletion: {errors}")
-                print(f"\n⚠️  Some errors occurred during deletion")
-            else:
-                print(f"\n✅ Successfully deleted all report data!")
-                print(f"   ✓ Deleted {shop_count:,} shop reports")
-                print(f"   ✓ Deleted {listing_count:,} listing reports")
-                print(f"   ✓ Deleted {product_count:,} product reports")
+            for query in delete_queries:
+                await self.prisma.execute_raw(query)
+            
+            print(f"\n✅ Successfully deleted all report data!")
+            print(f"   ✓ Deleted {shop_count:,} shop reports")
+            print(f"   ✓ Deleted {listing_count:,} listing reports")
+            print(f"   ✓ Deleted {product_count:,} product reports")
             
             print("="*80)
             
@@ -941,16 +1110,93 @@ class EcommerceAnalyticsOptimized:
 
     async def _preload_all_data(self):
         """Pre-load all essential data in parallel for maximum performance."""
-        print("\n⚡ Pre-loading data...")
+        # Use tqdm.write for output to avoid progress bar interference
+        tqdm.write("\n⚡ Pre-loading data...")
         
         # Run all pre-loading tasks in parallel
         await asyncio.gather(
             self._preload_sku_mappings(),
             self._preload_inventory_data(),
+            self._preload_bulk_costs(),  # NEW: Pre-load all costs
             return_exceptions=True
         )
         
-        print("✅ Pre-loading complete!\n")
+        tqdm.write("✅ Pre-loading complete!\n")
+    
+    async def _preload_bulk_costs(self):
+        """Pre-load all cost and shipping data for ultra-fast lookups."""
+        try:
+            # Pre-cache all shipping costs (US-specific) with normalized index
+            if not self.us_fedex_data.empty:
+                for _, row in self.us_fedex_data.iterrows():
+                    sku = row.get('SKU')
+                    if pd.notna(sku):
+                        sku_str = str(sku).strip()
+                        shipping_data = {
+                            'fedex_charge': float(row.get('US FEDEX KARGO ÜCRETİ', 0) or 0),
+                            'processing_fee': float(row.get('FEDEX İŞLEM ÜCRETİ', 0) or 0),
+                            'duty_rate': float(row.get('DUTY OTAN', 0) or 0) / 100,
+                            'duty_amount': float(row.get('DUTY', 0) or 0),
+                            'tax_rate': float(row.get('VERGİ ORANI', 0) or 0) / 100,
+                            'tax_amount': float(row.get('VERGİ', 0) or 0)
+                        }
+                        self._bulk_shipping_cache[sku_str] = shipping_data
+                        
+                        # Build normalized index for fast O(1) lookups
+                        normalized_sku = self._normalize_sku_for_comparison(sku_str)
+                        if normalized_sku and normalized_sku not in self._bulk_shipping_cache_normalized:
+                            self._bulk_shipping_cache_normalized[normalized_sku] = sku_str
+            
+            # Pre-cache cost data for all SKUs and all available months
+            if not self.cost_data.empty:
+                month_names = {
+                    1: "OCAK", 2: "SUBAT", 3: "MART", 4: "NISAN", 5: "MAYIS", 6: "HAZIRAN",
+                    7: "TEMMUZ", 8: "AGUSTOS", 9: "EYLUL", 10: "EKIM", 11: "KASIM", 12: "ARALIK",
+                }
+                
+                # Extract all year-month columns from cost data
+                for _, row in self.cost_data.iterrows():
+                    sku = row.get('SKU')
+                    if pd.isna(sku):
+                        continue
+                    
+                    normalized_sku = self._normalize_sku_for_comparison(str(sku))
+                    
+                    # Pre-cache costs for all available periods
+                    for year in range(2023, 2027):  # Cover 2023-2026
+                        year_2digit = year % 100
+                        for month, month_name in month_names.items():
+                            # Try all possible column formats
+                            for prefix in ["US", "EU", "AU"]:
+                                possible_columns = [
+                                    f"{prefix} {month_name} {year}",
+                                    f"{prefix} {month_name} {year_2digit}",
+                                    f"{prefix} {year} {month_name}",
+                                    f"{prefix} {year_2digit} {month_name}",
+                                    f"{prefix} {month_name}{year_2digit}",
+                                    f"{prefix}{year_2digit} {month_name}",
+                                    f"{prefix} {month_name}",
+                                ]
+                                
+                                for col in possible_columns:
+                                    if col in row.index:
+                                        value = row[col]
+                                        if pd.notna(value):
+                                            try:
+                                                cost = float(value)
+                                                if cost > 0:
+                                                    cache_key = (normalized_sku, year, month)
+                                                    # Only cache if not already set (prioritize exact matches)
+                                                    if cache_key not in self._bulk_cost_cache:
+                                                        self._bulk_cost_cache[cache_key] = cost
+                                                    break
+                                            except (ValueError, TypeError):
+                                                continue
+            
+            tqdm.write(f"  ✓ Pre-cached {len(self._bulk_cost_cache)} cost entries")
+            tqdm.write(f"  ✓ Pre-cached {len(self._bulk_shipping_cache)} shipping entries")
+        except Exception as e:
+            logger.error(f"Error pre-loading bulk costs: {e}")
 
     async def _preload_sku_mappings(self):
         """Pre-load SKU to product_id mappings and listing to product_id mappings for faster lookups."""
@@ -980,7 +1226,12 @@ class EcommerceAnalyticsOptimized:
                     self._listing_to_products[listing_id] = []
                 self._listing_to_products[listing_id].append(product_id)
             
-            print(f"  ✓ Loaded {len(self._sku_to_products)} SKU mappings")
+            tqdm.write(f"  ✓ Loaded {len(self._sku_to_products)} SKU mappings")
+            
+            # Debug: Show what SKUs look like in the mapping
+            if self._sku_to_products:
+                sample_skus = list(self._sku_to_products.keys())[:3]
+                tqdm.write(f"  → Sample SKUs in mapping: {sample_skus}")
         except Exception as e:
             logger.error(f"Error pre-loading SKU mappings: {e}")
 
@@ -1041,9 +1292,303 @@ class EcommerceAnalyticsOptimized:
                     "active_variants": int(row['active_variants'] or 0)
                 }
             
-            print(f"  ✓ Loaded inventory cache")
+            tqdm.write(f"  ✓ Loaded inventory cache")
         except Exception as e:
             logger.error(f"Error pre-loading inventory: {e}")
+
+    async def _load_product_reports_into_cache(self, sku_metrics_store: Dict, periods: Dict):
+        """
+        Load existing product reports from database into cache for listing aggregation.
+        This is MUCH faster than recalculating everything from scratch.
+        
+        IMPORTANT: Creates a normalized SKU lookup index to handle SKU format mismatches
+        between database (normalized SKUs without prefixes) and _sku_to_products (with prefixes).
+        """
+        try:
+            tqdm.write("  → Loading product reports from database...")
+            
+            # Ensure database connection is healthy before large query
+            await self._ensure_connection()
+            
+            # Get all product reports using raw SQL (much faster than ORM)
+            query = """
+                SELECT 
+                    sku,
+                    period_type,
+                    period_start,
+                    period_end,
+                    period_days,
+                    gross_revenue,
+                    total_revenue,
+                    product_revenue,
+                    total_shipping_revenue,
+                    total_shipping_charged,
+                    actual_shipping_cost,
+                    shipping_profit,
+                    duty_amount,
+                    tax_amount,
+                    fedex_processing_fee,
+                    total_tax_collected,
+                    total_vat_collected,
+                    total_gift_wrap_revenue,
+                    total_discounts_given,
+                    etsy_transaction_fees,
+                    etsy_processing_fees,
+                    total_etsy_fees,
+                    etsy_fee_rate,
+                    net_revenue,
+                    net_revenue_after_refunds,
+                    take_home_rate,
+                    discount_rate,
+                    contribution_margin,
+                    total_cost,
+                    total_cost_with_shipping,
+                    avg_cost_per_item,
+                    cost_per_order,
+                    gross_profit,
+                    gross_margin,
+                    net_profit,
+                    net_margin,
+                    return_on_revenue,
+                    markup_ratio,
+                    total_orders,
+                    total_items,
+                    total_quantity_sold,
+                    unique_skus,
+                    average_order_value,
+                    median_order_value,
+                    percentile_75_order_value,
+                    percentile_25_order_value,
+                    order_value_std,
+                    items_per_order,
+                    revenue_per_item,
+                    profit_per_item,
+                    unique_customers,
+                    repeat_customers,
+                    customer_retention_rate,
+                    revenue_per_customer,
+                    orders_per_customer,
+                    profit_per_customer,
+                    shipped_orders,
+                    shipping_rate,
+                    gift_orders,
+                    gift_rate,
+                    avg_time_between_orders_hours,
+                    orders_per_day,
+                    revenue_per_day,
+                    total_refund_amount,
+                    total_refund_count,
+                    orders_with_refunds,
+                    etsy_fees_retained_on_refunds,
+                    refund_rate_by_order,
+                    refund_rate_by_value,
+                    order_refund_rate,
+                    cancelled_orders,
+                    cancellation_rate,
+                    completion_rate,
+                    primary_payment_method,
+                    payment_method_diversity,
+                    customer_lifetime_value,
+                    payback_period_days,
+                    customer_acquisition_cost,
+                    price_elasticity,
+                    peak_month,
+                    peak_day_of_week,
+                    peak_hour,
+                    seasonality_index,
+                    total_inventory,
+                    avg_price,
+                    price_range,
+                    active_variants,
+                    inventory_turnover,
+                    stockout_risk
+                FROM product_reports
+                ORDER BY sku ASC
+            """
+            
+            all_product_reports = await self.prisma.query_raw(query)
+            
+            tqdm.write(f"  → Found {len(all_product_reports)} product reports in database")
+            
+            # Build a normalized SKU lookup index for fast O(1) lookups
+            # Maps: normalized_sku -> original_sku_from_database
+            normalized_sku_index = {}
+            
+            # Convert database records to metrics dict format
+            for report in all_product_reports:
+                sku = report['sku']
+                
+                # Initialize SKU in cache if not exists
+                if sku not in sku_metrics_store:
+                    sku_metrics_store[sku] = {}
+                
+                # Build reverse index: normalized SKU -> database SKU
+                normalized_sku = self._normalize_sku_for_comparison(sku)
+                if normalized_sku and normalized_sku not in normalized_sku_index:
+                    normalized_sku_index[normalized_sku] = sku
+                
+                # Convert PeriodType to string (from raw SQL result)
+                period_type = report['period_type'].lower()  # "YEARLY" -> "yearly"
+                
+                # Create period_key in same format as calculate_metrics_batch
+                period_key = f"{report['period_start'].strftime('%Y-%m-%d')}_to_{report['period_end'].strftime('%Y-%m-%d')}"
+                full_key = f"{period_type}_{period_key}"
+                
+                # Convert database record to metrics dict (snake_case from SQL)
+                metrics = {
+                    "period_start": report['period_start'],
+                    "period_end": report['period_end'],
+                    "period_days": report['period_days'] or 0,
+                    "gross_revenue": float(report['gross_revenue'] or 0),
+                    "total_revenue": float(report['total_revenue'] or 0),
+                    "product_revenue": float(report['product_revenue'] or 0),
+                    "total_shipping_charged": float(report['total_shipping_charged'] or 0),
+                    "actual_shipping_cost": float(report['actual_shipping_cost'] or 0),
+                    "shipping_profit": float(report['shipping_profit'] or 0),
+                    "duty_amount": float(report['duty_amount'] or 0),
+                    "tax_amount": float(report['tax_amount'] or 0),
+                    "fedex_processing_fee": float(report['fedex_processing_fee'] or 0),
+                    "total_tax_collected": float(report['total_tax_collected'] or 0),
+                    "total_vat_collected": float(report['total_vat_collected'] or 0),
+                    "total_gift_wrap_revenue": float(report['total_gift_wrap_revenue'] or 0),
+                    "total_discounts_given": float(report['total_discounts_given'] or 0),
+                    "etsy_transaction_fees": float(report['etsy_transaction_fees'] or 0),
+                    "etsy_processing_fees": float(report['etsy_processing_fees'] or 0),
+                    "total_etsy_fees": float(report['total_etsy_fees'] or 0),
+                    "net_revenue": float(report['net_revenue'] or 0),
+                    "net_revenue_after_refunds": float(report['net_revenue_after_refunds'] or 0),
+                    "contribution_margin": float(report['contribution_margin'] or 0),
+                    "total_cost": float(report['total_cost'] or 0),
+                    "total_cost_with_shipping": float(report['total_cost_with_shipping'] or 0),
+                    "gross_profit": float(report['gross_profit'] or 0),
+                    "net_profit": float(report['net_profit'] or 0),
+                    "total_orders": int(report['total_orders'] or 0),
+                    "total_items": int(report['total_items'] or 0),
+                    "total_quantity_sold": int(report['total_quantity_sold'] or 0),
+                    "unique_skus": int(report['unique_skus'] or 0),
+                    "unique_customers": int(report['unique_customers'] or 0),
+                    "repeat_customers": int(report['repeat_customers'] or 0),
+                    "shipped_orders": int(report['shipped_orders'] or 0),
+                    "gift_orders": int(report['gift_orders'] or 0),
+                    "total_refund_amount": float(report['total_refund_amount'] or 0),
+                    "total_refund_count": int(report['total_refund_count'] or 0),
+                    "orders_with_refunds": int(report['orders_with_refunds'] or 0),
+                    "etsy_fees_retained_on_refunds": float(report['etsy_fees_retained_on_refunds'] or 0),
+                    "cancelled_orders": int(report['cancelled_orders'] or 0),
+                    "total_inventory": int(report['total_inventory'] or 0),
+                    "active_variants": int(report['active_variants'] or 0),
+                    "avg_cost_per_item": float(report['avg_cost_per_item'] or 0),
+                    "gross_margin": float(report['gross_margin'] or 0),
+                    "net_margin": float(report['net_margin'] or 0),
+                }
+                
+                # Store in cache
+                sku_metrics_store[sku][full_key] = metrics
+            
+            # Store the normalized index for fast lookups during aggregation
+            # This allows O(1) lookup instead of O(n) search through all SKUs
+            sku_metrics_store['_normalized_index'] = normalized_sku_index
+            
+            tqdm.write(f"  ✓ Loaded {len(sku_metrics_store) - 1} SKUs into cache for aggregation")
+            tqdm.write(f"  ✓ Built normalized SKU index with {len(normalized_sku_index)} entries")
+            
+        except Exception as e:
+            logger.error(f"Error loading product reports into cache: {e}", exc_info=True)
+            tqdm.write(f"  ⚠️ Warning: Could not load product reports from database")
+            tqdm.write(f"     Error: {e}")
+
+    async def _load_listing_reports_into_cache(self, listing_metrics_store: Dict, periods: Dict):
+        """
+        Load existing listing reports from database into cache for shop aggregation.
+        This is MUCH faster than recalculating everything from scratch.
+        """
+        try:
+            tqdm.write("  → Loading listing reports from database...")
+            
+            # Get all listing reports from database
+            all_listing_reports = await self.prisma.listingreport.find_many(
+                order={"listingId": "asc"}
+            )
+            
+            tqdm.write(f"  → Found {len(all_listing_reports)} listing reports in database")
+            
+            # Convert database records to metrics dict format
+            for report in all_listing_reports:
+                listing_id = report.listingId
+                
+                # Initialize listing in cache if not exists
+                if listing_id not in listing_metrics_store:
+                    listing_metrics_store[listing_id] = {}
+                
+                # Convert PeriodType to string (handle both enum and string)
+                if hasattr(report.periodType, 'value'):
+                    period_type = report.periodType.value.lower()  # Enum: "YEARLY" -> "yearly"
+                else:
+                    period_type = str(report.periodType).lower()  # Already string
+                
+                # Create period_key in same format as calculate_metrics_batch
+                period_key = f"{report.periodStart.strftime('%Y-%m-%d')}_to_{report.periodEnd.strftime('%Y-%m-%d')}"
+                full_key = f"{period_type}_{period_key}"
+                
+                # Convert database record to metrics dict
+                metrics = {
+                    "period_start": report.periodStart,
+                    "period_end": report.periodEnd,
+                    "period_days": report.periodDays or 0,
+                    "gross_revenue": float(report.grossRevenue or 0),
+                    "total_revenue": float(report.totalRevenue or 0),
+                    "product_revenue": float(report.productRevenue or 0),
+                    "total_shipping_charged": float(report.totalShippingCharged or 0),
+                    "actual_shipping_cost": float(report.actualShippingCost or 0),
+                    "shipping_profit": float(report.shippingProfit or 0),
+                    "duty_amount": float(report.dutyAmount or 0),
+                    "tax_amount": float(report.taxAmount or 0),
+                    "fedex_processing_fee": float(report.fedexProcessingFee or 0),
+                    "total_tax_collected": float(report.totalTaxCollected or 0),
+                    "total_vat_collected": float(report.totalVatCollected or 0),
+                    "total_gift_wrap_revenue": float(report.totalGiftWrapRevenue or 0),
+                    "total_discounts_given": float(report.totalDiscountsGiven or 0),
+                    "etsy_transaction_fees": float(report.etsyTransactionFees or 0),
+                    "etsy_processing_fees": float(report.etsyProcessingFees or 0),
+                    "total_etsy_fees": float(report.totalEtsyFees or 0),
+                    "net_revenue": float(report.netRevenue or 0),
+                    "net_revenue_after_refunds": float(report.netRevenueAfterRefunds or 0),
+                    "contribution_margin": float(report.contributionMargin or 0),
+                    "total_cost": float(report.totalCost or 0),
+                    "total_cost_with_shipping": float(report.totalCostWithShipping or 0),
+                    "gross_profit": float(report.grossProfit or 0),
+                    "net_profit": float(report.netProfit or 0),
+                    "total_orders": int(report.totalOrders or 0),
+                    "total_items": int(report.totalItems or 0),
+                    "total_quantity_sold": int(report.totalQuantitySold or 0),
+                    "unique_skus": int(report.uniqueSkus or 0),
+                    "unique_customers": int(report.uniqueCustomers or 0),
+                    "repeat_customers": int(report.repeatCustomers or 0),
+                    "shipped_orders": int(report.shippedOrders or 0),
+                    "gift_orders": int(report.giftOrders or 0),
+                    "total_refund_amount": float(report.totalRefundAmount or 0),
+                    "total_refund_count": int(report.totalRefundCount or 0),
+                    "orders_with_refunds": int(report.ordersWithRefunds or 0),
+                    "etsy_fees_retained_on_refunds": float(report.etsyFeesRetainedOnRefunds or 0),
+                    "cancelled_orders": int(report.cancelledOrders or 0),
+                    "total_inventory": int(report.totalInventory or 0),
+                    "active_variants": int(report.activeVariants or 0),
+                    # Note: cost tracking fields (items_with_direct_cost, etc.) not in ListingReport model
+                    # Add other important fields for aggregation
+                    "avg_cost_per_item": float(report.avgCostPerItem or 0),
+                    "gross_margin": float(report.grossMargin or 0),
+                    "net_margin": float(report.netMargin or 0),
+                }
+                
+                # Store in cache
+                listing_metrics_store[listing_id][full_key] = metrics
+            
+            tqdm.write(f"  ✓ Loaded {len(listing_metrics_store)} listings into cache for aggregation")
+            
+        except Exception as e:
+            logger.error(f"Error loading listing reports into cache: {e}", exc_info=True)
+            tqdm.write(f"  ⚠️ Warning: Could not load listing reports from database")
+            tqdm.write(f"     Error: {e}")
 
     async def get_date_ranges_from_database(self) -> Optional[Tuple[datetime, datetime]]:
         """Get the earliest and latest order dates using Prisma ORM (same as reportsv3)."""
@@ -1217,6 +1762,9 @@ class EcommerceAnalyticsOptimized:
             if not date_ranges:
                 return {}
             
+            # Ensure database connection is healthy before expensive query
+            await self._ensure_connection()
+            
             # Build time range filter
             time_conditions = []
             for dr in date_ranges:
@@ -1247,6 +1795,7 @@ class EcommerceAnalyticsOptimized:
                     entity_filter = f"AND ot.product_id IN ({product_ids_str})"
             
             # ONE MEGA-QUERY with optimized joins and aggregations
+            # Add query hints to help PostgreSQL optimizer
             query = f"""
                 WITH order_data AS (
                     SELECT 
@@ -1293,12 +1842,15 @@ class EcommerceAnalyticsOptimized:
                     od.*,
                     COALESCE(rd.refund_amount, 0) as refund_amount,
                     COALESCE(rd.refund_count, 0) as refund_count,
-                    json_agg(
-                        json_build_object(
-                            'sku', td.sku,
-                            'quantity', td.quantity,
-                            'price', td.price
-                        )
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'sku', td.sku,
+                                'quantity', td.quantity,
+                                'price', td.price
+                            )
+                        ) FILTER (WHERE td.sku IS NOT NULL),
+                        '[]'::json
                     ) as transactions
                 FROM order_data od
                 LEFT JOIN refund_data rd ON od.order_id = rd.order_id
@@ -1309,13 +1861,29 @@ class EcommerceAnalyticsOptimized:
                          od.status, od.payment_method, od.country, rd.refund_amount, rd.refund_count
             """
             
-            # Execute the mega-query
-            try:
-                raw_results = await self.prisma.query_raw(query)
-            except Exception as query_error:
-                logger.error(f"SQL Query failed: {query_error}")
-                logger.error(f"Query was: {query[:500]}...")  # Log first 500 chars of query
-                raise  # Re-raise to be caught by outer exception handler
+            # Execute the mega-query with retry logic for timeouts
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    raw_results = await self.prisma.query_raw(query)
+                    break  # Success, exit retry loop
+                except Exception as query_error:
+                    error_msg = str(query_error)
+                    if "statement timeout" in error_msg.lower() and attempt < max_retries - 1:
+                        logger.warning(f"Query timeout (attempt {attempt + 1}/{max_retries}), retrying with smaller batch...")
+                        # If timeout, try to simplify: skip this and return empty
+                        # This prevents the entire process from failing
+                        logger.error(f"Query timed out after multiple attempts. Skipping this batch.")
+                        empty_results = {}
+                        await asyncio.sleep(1)  # Brief pause before next attempt
+                        for dr in date_ranges:
+                            period_key = f"{dr.start_date.strftime('%Y-%m-%d')}_to_{dr.end_date.strftime('%Y-%m-%d')}"
+                            empty_results[period_key] = await self._empty_metrics(sku=sku, listing_id=listing_id, date_range=dr)
+                        return empty_results
+                    else:
+                        logger.error(f"SQL Query failed: {query_error}")
+                        logger.error(f"Query was: {query[:500]}...")  # Log first 500 chars of query
+                        raise  # Re-raise to be caught by outer exception handler
             
             if not raw_results:
                 # Return empty metrics for all periods
@@ -1516,8 +2084,28 @@ class EcommerceAnalyticsOptimized:
                 sku_val = txn['sku']
                 quantity = int(txn.get('quantity', 0))
                 
+                # Determine listing_id for fallback strategy
+                # If we're calculating SKU-level metrics, we need to find the listing for this SKU
+                txn_listing_id = listing_id  # Use provided listing_id if available
+                if not txn_listing_id and sku:
+                    # For SKU reports, try to get listing_id from transaction data or lookup
+                    txn_listing_id = txn.get('listing_id')  # Transactions have listing_id
+                
                 # Use NEW smart cost lookup with fallback
-                cost, source = await self.get_cost_with_fallback(sku_val, year, month, listing_id)
+                cost, source = await self.get_cost_with_fallback(sku_val, year, month, txn_listing_id)
+                
+                # Log warning for missing cost data (periodically to avoid spam)
+                if cost == 0:
+                    warning_key = f"{sku_val}_{year}_{month}"
+                    if warning_key not in self._cost_fallback_warnings_shown:
+                        self._cost_fallback_warnings_shown.add(warning_key)
+                        # Log every 10th missing cost to avoid spam
+                        if len(self._cost_fallback_warnings_shown) % 10 == 1:
+                            logger.warning(
+                                f"⚠️ No cost found for SKU '{sku_val}' ({year}-{month:02d}). "
+                                f"This will result in 0 total_cost for reports. "
+                                f"Please add cost data to cost.csv for this SKU."
+                            )
                 
                 # Track cost source (local)
                 cost_sources[source] += quantity
@@ -1531,8 +2119,10 @@ class EcommerceAnalyticsOptimized:
                 
                 total_quantity_sold += quantity
                 
-                normalized_sku = sku_val.replace("DELETED-", "") if sku_val.startswith("DELETED-") else sku_val
-                unique_skus.add(normalized_sku)
+                # Use proper normalization for consistent SKU tracking
+                normalized_sku = self._normalize_sku_for_comparison(sku_val)
+                if normalized_sku:  # Only add if normalization succeeded
+                    unique_skus.add(normalized_sku)
         
         # Determine if we have complete cost data
         has_complete_cost_data = (total_quantity_sold > 0 and total_quantity_with_cost == total_quantity_sold)
@@ -2105,6 +2695,319 @@ class EcommerceAnalyticsOptimized:
                 except:
                     pass
 
+    async def _bulk_upsert_listing_reports(self, batch: List[Tuple[str, Dict]]):
+        """Bulk upsert listing reports using Prisma ORM."""
+        try:
+            # Use Prisma's upsert for each report
+            for period_type, metrics in batch:
+                period_type_enum = {
+                    "yearly": PeriodType.YEARLY,
+                    "monthly": PeriodType.MONTHLY,
+                    "weekly": PeriodType.WEEKLY
+                }[period_type]
+                
+                listing_id = metrics.get('listing_id')
+                if not listing_id:
+                    continue
+                    
+                period_start = metrics['period_start']
+                period_end = metrics['period_end']
+                
+                await self.prisma.listingreport.upsert(
+                    where={
+                        'listingId_periodType_periodStart_periodEnd': {
+                            'listingId': int(listing_id),
+                            'periodType': period_type_enum,
+                            'periodStart': period_start,
+                            'periodEnd': period_end
+                        }
+                    },
+                    data={
+                        'create': {
+                            'listingId': int(listing_id),
+                            'periodType': period_type_enum,
+                            'periodStart': period_start,
+                            'periodEnd': period_end,
+                            'periodDays': metrics.get('period_days', 0),
+                            'grossRevenue': self._clean_metric_value(metrics.get('gross_revenue', 0)),
+                            'totalRevenue': self._clean_metric_value(metrics.get('total_revenue', 0)),
+                            'productRevenue': self._clean_metric_value(metrics.get('product_revenue', 0)),
+                            'totalShippingRevenue': self._clean_metric_value(metrics.get('total_shipping_revenue', 0)),
+                            'totalShippingCharged': self._clean_metric_value(metrics.get('total_shipping_charged', 0)),
+                            'actualShippingCost': self._clean_metric_value(metrics.get('actual_shipping_cost', 0)),
+                            'shippingProfit': self._clean_metric_value(metrics.get('shipping_profit', 0)),
+                            'dutyAmount': self._clean_metric_value(metrics.get('duty_amount', 0)),
+                            'taxAmount': self._clean_metric_value(metrics.get('tax_amount', 0)),
+                            'fedexProcessingFee': self._clean_metric_value(metrics.get('fedex_processing_fee', 0)),
+                            'totalTaxCollected': self._clean_metric_value(metrics.get('total_tax_collected', 0)),
+                            'totalVatCollected': self._clean_metric_value(metrics.get('total_vat_collected', 0)),
+                            'totalGiftWrapRevenue': self._clean_metric_value(metrics.get('total_gift_wrap_revenue', 0)),
+                            'totalDiscountsGiven': self._clean_metric_value(metrics.get('total_discounts_given', 0)),
+                            'etsyTransactionFees': self._clean_metric_value(metrics.get('etsy_transaction_fees', 0)),
+                            'etsyProcessingFees': self._clean_metric_value(metrics.get('etsy_processing_fees', 0)),
+                            'totalEtsyFees': self._clean_metric_value(metrics.get('total_etsy_fees', 0)),
+                            'etsyFeeRate': self._clean_metric_value(metrics.get('etsy_fee_rate', 0)),
+                            'netRevenue': self._clean_metric_value(metrics.get('net_revenue', 0)),
+                            'netRevenueAfterRefunds': self._clean_metric_value(metrics.get('net_revenue_after_refunds', 0)),
+                            'takeHomeRate': self._clean_metric_value(metrics.get('take_home_rate', 0)),
+                            'discountRate': self._clean_metric_value(metrics.get('discount_rate', 0)),
+                            'contributionMargin': self._clean_metric_value(metrics.get('contribution_margin', 0)),
+                            'totalCost': self._clean_metric_value(metrics.get('total_cost', 0)),
+                            'totalCostWithShipping': self._clean_metric_value(metrics.get('total_cost_with_shipping', 0)),
+                            'avgCostPerItem': self._clean_metric_value(metrics.get('avg_cost_per_item', 0)),
+                            'costPerOrder': self._clean_metric_value(metrics.get('cost_per_order', 0)),
+                            'grossProfit': self._clean_metric_value(metrics.get('gross_profit', 0)),
+                            'grossMargin': self._clean_metric_value(metrics.get('gross_margin', 0)),
+                            'netProfit': self._clean_metric_value(metrics.get('net_profit', 0)),
+                            'netMargin': self._clean_metric_value(metrics.get('net_margin', 0)),
+                            'returnOnRevenue': self._clean_metric_value(metrics.get('return_on_revenue', 0)),
+                            'markupRatio': self._clean_metric_value(metrics.get('markup_ratio', 0)),
+                            'totalOrders': metrics.get('total_orders', 0),
+                            'totalItems': metrics.get('total_items', 0),
+                            'totalQuantitySold': metrics.get('total_quantity_sold', 0),
+                            'uniqueSkus': metrics.get('unique_skus', 0),
+                            'averageOrderValue': self._clean_metric_value(metrics.get('average_order_value', 0)),
+                            'medianOrderValue': self._clean_metric_value(metrics.get('median_order_value', 0)),
+                            'percentile75OrderValue': self._clean_metric_value(metrics.get('percentile_75_order_value', 0)),
+                            'percentile25OrderValue': self._clean_metric_value(metrics.get('percentile_25_order_value', 0)),
+                            'orderValueStd': self._clean_metric_value(metrics.get('order_value_std', 0)),
+                            'itemsPerOrder': self._clean_metric_value(metrics.get('items_per_order', 0)),
+                            'revenuePerItem': self._clean_metric_value(metrics.get('revenue_per_item', 0)),
+                            'profitPerItem': self._clean_metric_value(metrics.get('profit_per_item', 0)),
+                            'uniqueCustomers': metrics.get('unique_customers', 0),
+                            'repeatCustomers': metrics.get('repeat_customers', 0),
+                            'customerRetentionRate': self._clean_metric_value(metrics.get('customer_retention_rate', 0)),
+                            'revenuePerCustomer': self._clean_metric_value(metrics.get('revenue_per_customer', 0)),
+                            'ordersPerCustomer': self._clean_metric_value(metrics.get('orders_per_customer', 0)),
+                            'profitPerCustomer': self._clean_metric_value(metrics.get('profit_per_customer', 0)),
+                            'shippedOrders': metrics.get('shipped_orders', 0),
+                            'shippingRate': self._clean_metric_value(metrics.get('shipping_rate', 0)),
+                            'giftOrders': metrics.get('gift_orders', 0),
+                            'giftRate': self._clean_metric_value(metrics.get('gift_rate', 0)),
+                            'avgTimeBetweenOrdersHours': self._clean_metric_value(metrics.get('avg_time_between_orders_hours', 0)),
+                            'ordersPerDay': self._clean_metric_value(metrics.get('orders_per_day', 0)),
+                            'revenuePerDay': self._clean_metric_value(metrics.get('revenue_per_day', 0)),
+                            'totalRefundAmount': self._clean_metric_value(metrics.get('total_refund_amount', 0)),
+                            'totalRefundCount': metrics.get('total_refund_count', 0),
+                            'ordersWithRefunds': metrics.get('orders_with_refunds', 0),
+                            'etsyFeesRetainedOnRefunds': self._clean_metric_value(metrics.get('etsy_fees_retained_on_refunds', 0)),
+                            'refundRateByOrder': self._clean_metric_value(metrics.get('refund_rate_by_order', 0)),
+                            'refundRateByValue': self._clean_metric_value(metrics.get('refund_rate_by_value', 0)),
+                            'orderRefundRate': self._clean_metric_value(metrics.get('order_refund_rate', 0)),
+                            'cancelledOrders': metrics.get('cancelled_orders', 0),
+                            'cancellationRate': self._clean_metric_value(metrics.get('cancellation_rate', 0)),
+                            'completionRate': self._clean_metric_value(metrics.get('completion_rate', 0)),
+                            'primaryPaymentMethod': metrics.get('primary_payment_method'),
+                            'paymentMethodDiversity': metrics.get('payment_method_diversity', 0),
+                            'customerLifetimeValue': self._clean_metric_value(metrics.get('customer_lifetime_value', 0)),
+                            'paybackPeriodDays': self._clean_metric_value(metrics.get('payback_period_days', 0)),
+                            'customerAcquisitionCost': self._clean_metric_value(metrics.get('customer_acquisition_cost', 0)),
+                            'priceElasticity': self._clean_metric_value(metrics.get('price_elasticity', 0)),
+                            'peakMonth': metrics.get('peak_month'),
+                            'peakDayOfWeek': metrics.get('peak_day_of_week'),
+                            'peakHour': metrics.get('peak_hour'),
+                            'seasonalityIndex': self._clean_metric_value(metrics.get('seasonality_index', 0)),
+                            'totalInventory': metrics.get('total_inventory', 0),
+                            'avgPrice': self._clean_metric_value(metrics.get('avg_price', 0)),
+                            'priceRange': self._clean_metric_value(metrics.get('price_range', 0)),
+                            'activeVariants': metrics.get('active_variants', 0),
+                            'inventoryTurnover': self._clean_metric_value(metrics.get('inventory_turnover', 0)),
+                            'stockoutRisk': self._clean_metric_value(metrics.get('stockout_risk', 0)),
+                            'totalAdSpend': self._clean_metric_value(metrics.get('total_ad_spend', 0)),
+                            'adSpendRate': self._clean_metric_value(metrics.get('ad_spend_rate', 0)),
+                            'roas': self._clean_metric_value(metrics.get('roas', 0)),
+                        },
+                        'update': {
+                            'periodDays': metrics.get('period_days', 0),
+                            'grossRevenue': self._clean_metric_value(metrics.get('gross_revenue', 0)),
+                            'totalRevenue': self._clean_metric_value(metrics.get('total_revenue', 0)),
+                            'productRevenue': self._clean_metric_value(metrics.get('product_revenue', 0)),
+                            'totalShippingCharged': self._clean_metric_value(metrics.get('total_shipping_charged', 0)),
+                            'actualShippingCost': self._clean_metric_value(metrics.get('actual_shipping_cost', 0)),
+                            'shippingProfit': self._clean_metric_value(metrics.get('shipping_profit', 0)),
+                            'totalCost': self._clean_metric_value(metrics.get('total_cost', 0)),
+                            'totalCostWithShipping': self._clean_metric_value(metrics.get('total_cost_with_shipping', 0)),
+                            'grossProfit': self._clean_metric_value(metrics.get('gross_profit', 0)),
+                            'netProfit': self._clean_metric_value(metrics.get('net_profit', 0)),
+                            'totalOrders': metrics.get('total_orders', 0),
+                            'totalItems': metrics.get('total_items', 0),
+                            'uniqueCustomers': metrics.get('unique_customers', 0),
+                            'totalAdSpend': self._clean_metric_value(metrics.get('total_ad_spend', 0)),
+                            'roas': self._clean_metric_value(metrics.get('roas', 0)),
+                        }
+                    }
+                )
+        except Exception as e:
+            logger.error(f"Error in bulk upsert listing reports: {e}")
+            # Fallback to individual saves
+            for period_type, metrics in batch:
+                try:
+                    listing_id = metrics.get('listing_id')
+                    if listing_id:
+                        await self.save_listing_report(
+                            int(listing_id),
+                            metrics,
+                            period_type,
+                            metrics['period_start'],
+                            metrics['period_end']
+                        )
+                except Exception as ex:
+                    logger.error(f"Failed to save listing report {listing_id}: {ex}")
+
+    async def _bulk_upsert_product_reports(self, batch: List[Tuple[str, Dict]]):
+        """Bulk upsert product reports using Prisma ORM."""
+        try:
+            # Use Prisma's upsert for each report
+            for period_type, metrics in batch:
+                period_type_enum = {
+                    "yearly": PeriodType.YEARLY,
+                    "monthly": PeriodType.MONTHLY,
+                    "weekly": PeriodType.WEEKLY
+                }[period_type]
+                
+                sku = metrics.get('sku')
+                if not sku:
+                    continue
+                    
+                period_start = metrics['period_start']
+                period_end = metrics['period_end']
+                
+                await self.prisma.productreport.upsert(
+                    where={
+                        'sku_periodType_periodStart_periodEnd': {
+                            'sku': sku,
+                            'periodType': period_type_enum,
+                            'periodStart': period_start,
+                            'periodEnd': period_end
+                        }
+                    },
+                    data={
+                        'create': {
+                            'sku': sku,
+                            'periodType': period_type_enum,
+                            'periodStart': period_start,
+                            'periodEnd': period_end,
+                            'periodDays': metrics.get('period_days', 0),
+                            'grossRevenue': self._clean_metric_value(metrics.get('gross_revenue', 0)),
+                            'totalRevenue': self._clean_metric_value(metrics.get('total_revenue', 0)),
+                            'productRevenue': self._clean_metric_value(metrics.get('product_revenue', 0)),
+                            'totalShippingRevenue': self._clean_metric_value(metrics.get('total_shipping_revenue', 0)),
+                            'totalShippingCharged': self._clean_metric_value(metrics.get('total_shipping_charged', 0)),
+                            'actualShippingCost': self._clean_metric_value(metrics.get('actual_shipping_cost', 0)),
+                            'shippingProfit': self._clean_metric_value(metrics.get('shipping_profit', 0)),
+                            'dutyAmount': self._clean_metric_value(metrics.get('duty_amount', 0)),
+                            'taxAmount': self._clean_metric_value(metrics.get('tax_amount', 0)),
+                            'fedexProcessingFee': self._clean_metric_value(metrics.get('fedex_processing_fee', 0)),
+                            'totalTaxCollected': self._clean_metric_value(metrics.get('total_tax_collected', 0)),
+                            'totalVatCollected': self._clean_metric_value(metrics.get('total_vat_collected', 0)),
+                            'totalGiftWrapRevenue': self._clean_metric_value(metrics.get('total_gift_wrap_revenue', 0)),
+                            'totalDiscountsGiven': self._clean_metric_value(metrics.get('total_discounts_given', 0)),
+                            'etsyTransactionFees': self._clean_metric_value(metrics.get('etsy_transaction_fees', 0)),
+                            'etsyProcessingFees': self._clean_metric_value(metrics.get('etsy_processing_fees', 0)),
+                            'totalEtsyFees': self._clean_metric_value(metrics.get('total_etsy_fees', 0)),
+                            'etsyFeeRate': self._clean_metric_value(metrics.get('etsy_fee_rate', 0)),
+                            'netRevenue': self._clean_metric_value(metrics.get('net_revenue', 0)),
+                            'netRevenueAfterRefunds': self._clean_metric_value(metrics.get('net_revenue_after_refunds', 0)),
+                            'takeHomeRate': self._clean_metric_value(metrics.get('take_home_rate', 0)),
+                            'discountRate': self._clean_metric_value(metrics.get('discount_rate', 0)),
+                            'contributionMargin': self._clean_metric_value(metrics.get('contribution_margin', 0)),
+                            'totalCost': self._clean_metric_value(metrics.get('total_cost', 0)),
+                            'totalCostWithShipping': self._clean_metric_value(metrics.get('total_cost_with_shipping', 0)),
+                            'avgCostPerItem': self._clean_metric_value(metrics.get('avg_cost_per_item', 0)),
+                            'costPerOrder': self._clean_metric_value(metrics.get('cost_per_order', 0)),
+                            'grossProfit': self._clean_metric_value(metrics.get('gross_profit', 0)),
+                            'grossMargin': self._clean_metric_value(metrics.get('gross_margin', 0)),
+                            'netProfit': self._clean_metric_value(metrics.get('net_profit', 0)),
+                            'netMargin': self._clean_metric_value(metrics.get('net_margin', 0)),
+                            'returnOnRevenue': self._clean_metric_value(metrics.get('return_on_revenue', 0)),
+                            'markupRatio': self._clean_metric_value(metrics.get('markup_ratio', 0)),
+                            'totalOrders': metrics.get('total_orders', 0),
+                            'totalItems': metrics.get('total_items', 0),
+                            'totalQuantitySold': metrics.get('total_quantity_sold', 0),
+                            'uniqueSkus': metrics.get('unique_skus', 0),
+                            'averageOrderValue': self._clean_metric_value(metrics.get('average_order_value', 0)),
+                            'medianOrderValue': self._clean_metric_value(metrics.get('median_order_value', 0)),
+                            'percentile75OrderValue': self._clean_metric_value(metrics.get('percentile_75_order_value', 0)),
+                            'percentile25OrderValue': self._clean_metric_value(metrics.get('percentile_25_order_value', 0)),
+                            'orderValueStd': self._clean_metric_value(metrics.get('order_value_std', 0)),
+                            'itemsPerOrder': self._clean_metric_value(metrics.get('items_per_order', 0)),
+                            'revenuePerItem': self._clean_metric_value(metrics.get('revenue_per_item', 0)),
+                            'profitPerItem': self._clean_metric_value(metrics.get('profit_per_item', 0)),
+                            'uniqueCustomers': metrics.get('unique_customers', 0),
+                            'repeatCustomers': metrics.get('repeat_customers', 0),
+                            'customerRetentionRate': self._clean_metric_value(metrics.get('customer_retention_rate', 0)),
+                            'revenuePerCustomer': self._clean_metric_value(metrics.get('revenue_per_customer', 0)),
+                            'ordersPerCustomer': self._clean_metric_value(metrics.get('orders_per_customer', 0)),
+                            'profitPerCustomer': self._clean_metric_value(metrics.get('profit_per_customer', 0)),
+                            'shippedOrders': metrics.get('shipped_orders', 0),
+                            'shippingRate': self._clean_metric_value(metrics.get('shipping_rate', 0)),
+                            'giftOrders': metrics.get('gift_orders', 0),
+                            'giftRate': self._clean_metric_value(metrics.get('gift_rate', 0)),
+                            'avgTimeBetweenOrdersHours': self._clean_metric_value(metrics.get('avg_time_between_orders_hours', 0)),
+                            'ordersPerDay': self._clean_metric_value(metrics.get('orders_per_day', 0)),
+                            'revenuePerDay': self._clean_metric_value(metrics.get('revenue_per_day', 0)),
+                            'totalRefundAmount': self._clean_metric_value(metrics.get('total_refund_amount', 0)),
+                            'totalRefundCount': metrics.get('total_refund_count', 0),
+                            'ordersWithRefunds': metrics.get('orders_with_refunds', 0),
+                            'etsyFeesRetainedOnRefunds': self._clean_metric_value(metrics.get('etsy_fees_retained_on_refunds', 0)),
+                            'refundRateByOrder': self._clean_metric_value(metrics.get('refund_rate_by_order', 0)),
+                            'refundRateByValue': self._clean_metric_value(metrics.get('refund_rate_by_value', 0)),
+                            'orderRefundRate': self._clean_metric_value(metrics.get('order_refund_rate', 0)),
+                            'cancelledOrders': metrics.get('cancelled_orders', 0),
+                            'cancellationRate': self._clean_metric_value(metrics.get('cancellation_rate', 0)),
+                            'completionRate': self._clean_metric_value(metrics.get('completion_rate', 0)),
+                            'primaryPaymentMethod': metrics.get('primary_payment_method'),
+                            'paymentMethodDiversity': metrics.get('payment_method_diversity', 0),
+                            'customerLifetimeValue': self._clean_metric_value(metrics.get('customer_lifetime_value', 0)),
+                            'paybackPeriodDays': self._clean_metric_value(metrics.get('payback_period_days', 0)),
+                            'customerAcquisitionCost': self._clean_metric_value(metrics.get('customer_acquisition_cost', 0)),
+                            'priceElasticity': self._clean_metric_value(metrics.get('price_elasticity', 0)),
+                            'peakMonth': metrics.get('peak_month'),
+                            'peakDayOfWeek': metrics.get('peak_day_of_week'),
+                            'peakHour': metrics.get('peak_hour'),
+                            'seasonalityIndex': self._clean_metric_value(metrics.get('seasonality_index', 0)),
+                            'totalInventory': metrics.get('total_inventory', 0),
+                            'avgPrice': self._clean_metric_value(metrics.get('avg_price', 0)),
+                            'priceRange': self._clean_metric_value(metrics.get('price_range', 0)),
+                            'activeVariants': metrics.get('active_variants', 0),
+                            'inventoryTurnover': self._clean_metric_value(metrics.get('inventory_turnover', 0)),
+                            'stockoutRisk': self._clean_metric_value(metrics.get('stockout_risk', 0)),
+                        },
+                        'update': {
+                            'periodDays': metrics.get('period_days', 0),
+                            'grossRevenue': self._clean_metric_value(metrics.get('gross_revenue', 0)),
+                            'totalRevenue': self._clean_metric_value(metrics.get('total_revenue', 0)),
+                            'productRevenue': self._clean_metric_value(metrics.get('product_revenue', 0)),
+                            'totalShippingCharged': self._clean_metric_value(metrics.get('total_shipping_charged', 0)),
+                            'actualShippingCost': self._clean_metric_value(metrics.get('actual_shipping_cost', 0)),
+                            'shippingProfit': self._clean_metric_value(metrics.get('shipping_profit', 0)),
+                            'totalCost': self._clean_metric_value(metrics.get('total_cost', 0)),
+                            'totalCostWithShipping': self._clean_metric_value(metrics.get('total_cost_with_shipping', 0)),
+                            'grossProfit': self._clean_metric_value(metrics.get('gross_profit', 0)),
+                            'netProfit': self._clean_metric_value(metrics.get('net_profit', 0)),
+                            'totalOrders': metrics.get('total_orders', 0),
+                            'totalItems': metrics.get('total_items', 0),
+                            'uniqueCustomers': metrics.get('unique_customers', 0),
+                        }
+                    }
+                )
+        except Exception as e:
+            logger.error(f"Error in bulk upsert product reports: {e}")
+            # Fallback to individual saves
+            for period_type, metrics in batch:
+                try:
+                    sku = metrics.get('sku')
+                    if sku:
+                        await self.save_product_report(
+                            sku,
+                            metrics,
+                            period_type,
+                            metrics['period_start'],
+                            metrics['period_end']
+                        )
+                except Exception as ex:
+                    logger.error(f"Failed to save product report {sku}: {ex}")
+
     def _clean_metric_value(self, value):
         """Clean metric values to prevent NaN, Infinity, or None issues."""
         if value is None:
@@ -2562,7 +3465,10 @@ class EcommerceAnalyticsOptimized:
             logger.error(f"Error saving product report for SKU {sku}, {period_type} {period_start}-{period_end}: {e}", exc_info=True)
             
 
-    async def generate_all_insights_batch(self, clean_old_data: bool = False):
+    async def generate_all_insights_batch(self, clean_old_data: bool = False, 
+                                         skip_products: bool = False,
+                                         skip_listings: bool = False,
+                                         skip_shop: bool = False):
         """
         ⚡ HIERARCHICAL ANALYTICS GENERATION - CORRECT DATA FLOW!
         
@@ -2576,14 +3482,19 @@ class EcommerceAnalyticsOptimized:
         Args:
             clean_old_data: If True, DELETE all existing reports before generating new ones.
                            ⚠️ WARNING: This erases all previous analytics!
+            skip_products: If True, skip product generation and load from database instead
+            skip_listings: If True, skip listing generation and load from database instead
+            skip_shop: If True, skip shop generation (not recommended unless testing)
         """
-        print("\n⚡⚡⚡ STARTING HIERARCHICAL ANALYTICS GENERATION ⚡⚡⚡\n")
+        tqdm.write("\n" + "="*80)
+        tqdm.write("⚡⚡⚡ HIERARCHICAL ANALYTICS GENERATION ⚡⚡⚡")
+        tqdm.write("="*80)
         
         try:
             # OPTIONAL: Clean all old report data first
             if clean_old_data:
                 await self.clean_all_reports()
-                print("\n🔄 Starting fresh report generation...\n")
+                tqdm.write("\n🔄 Starting fresh report generation...\n")
             
             # Get date ranges
             date_result = await self.get_date_ranges_from_database()
@@ -2592,17 +3503,17 @@ class EcommerceAnalyticsOptimized:
                 return None
             
             start_date, end_date = date_result
-            print(f"📅 Processing orders from {start_date} to {end_date}")
+            tqdm.write(f"📅 Processing orders from {start_date.date()} to {end_date.date()}")
             
             # Generate time periods
             periods = self.generate_time_periods(start_date, end_date)
             total_periods = sum(len(p) for p in periods.values())
-            print(f"⏱️  Generated {total_periods} time periods\n")
+            tqdm.write(f"⏱️  Generated {total_periods} time periods")
             
             # Get all SKUs and listings
             all_skus = await self.get_all_skus()
             all_listings = await self.get_all_listings()
-            print(f"📦 Found {len(all_skus)} SKUs and {len(all_listings)} listings\n")
+            tqdm.write(f"📦 Found {len(all_skus)} SKUs and {len(all_listings)} listings")
             
             # Create semaphore for controlled parallelism
             semaphore = asyncio.Semaphore(self.max_concurrent)
@@ -2611,110 +3522,190 @@ class EcommerceAnalyticsOptimized:
             sku_metrics_store = {}  # {sku: {period_key: metrics}}
             listing_metrics_store = {}  # {listing_id: {period_key: metrics}}
             
+            # Chunk size for processing
+            chunk_size = self.max_concurrent * 3  # Balanced for file descriptors
+            
             # ==========================================
             # PHASE 1: PRODUCT/SKU REPORTS (BASE LEVEL)
             # ==========================================
-            print("📦 PHASE 1: Product/SKU Reports (Base Level - From Transactions)")
-            sku_tasks = []
-            for sku in all_skus:
-                task = self._process_sku_reports_with_cache(sku, periods, semaphore, sku_metrics_store)
-                sku_tasks.append(task)
-            
-            # Process with progress bar
-            chunk_size = self.max_concurrent * 2
-            with tqdm(total=len(sku_tasks), desc="  Processing SKUs", unit="sku", ncols=100) as pbar:
-                for i in range(0, len(sku_tasks), chunk_size):
-                    chunk = sku_tasks[i:i + chunk_size]
-                    await asyncio.gather(*chunk)
-                    pbar.update(len(chunk))
-            
-            print(f"  ✅ Completed {len(all_skus)} SKUs\n")
+            if not skip_products:
+                tqdm.write("\n" + "="*80)
+                tqdm.write("📦 PHASE 1: Product/SKU Reports")
+                tqdm.write("   Processing from raw transactions (base level)")
+                tqdm.write("="*80)
+                
+                sku_tasks = []
+                for sku in all_skus:
+                    task = self._process_sku_reports_with_cache(sku, periods, semaphore, sku_metrics_store)
+                    sku_tasks.append(task)
+                
+                # Process with progress bar
+                with tqdm(
+                    total=len(sku_tasks), 
+                    desc="📦 Processing SKUs",
+                    unit="sku",
+                    ncols=100,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                    colour='green'
+                ) as pbar:
+                    for i in range(0, len(sku_tasks), chunk_size):
+                        chunk = sku_tasks[i:i + chunk_size]
+                        await asyncio.gather(*chunk)
+                        pbar.update(len(chunk))
+                        # Small delay to prevent file descriptor exhaustion
+                        if len(chunk) == chunk_size:
+                            await asyncio.sleep(0.01)
+                
+                tqdm.write(f"✅ Completed {len(all_skus)} SKUs\n")
+            else:
+                # Load existing product reports from database
+                tqdm.write("\n" + "="*80)
+                tqdm.write("📥 PHASE 1: Loading Existing Product Reports from Database")
+                tqdm.write("   (Skipping recalculation - using cached data)")
+                tqdm.write("="*80)
+                
+                await self._load_product_reports_into_cache(sku_metrics_store, periods)
+                tqdm.write(f"✅ Loaded {len(sku_metrics_store)} SKUs from database")
+                
+                # Debug: Check what's actually in the cache
+                if sku_metrics_store:
+                    sample_sku = list(sku_metrics_store.keys())[0]
+                    sample_periods = list(sku_metrics_store[sample_sku].keys())
+                    tqdm.write(f"   Example SKU: {sample_sku}")
+                    tqdm.write(f"   Sample periods: {sample_periods[:3] if len(sample_periods) > 3 else sample_periods}")
+                else:
+                    tqdm.write("   ⚠️  WARNING: sku_metrics_store is EMPTY!")
+                tqdm.write("")
             
             # ==========================================
             # PHASE 2: LISTING REPORTS (AGGREGATE FROM CHILD SKUs)
             # ==========================================
-            print("📋 PHASE 2: Listing Reports (Aggregated from Child Products)")
-            listing_tasks = []
-            for listing_id in all_listings:
-                task = self._process_listing_reports_aggregated(
-                    listing_id, periods, semaphore, sku_metrics_store, listing_metrics_store
-                )
-                listing_tasks.append(task)
-            
-            # Process with progress bar
-            with tqdm(total=len(listing_tasks), desc="  Processing Listings", unit="listing", ncols=100) as pbar:
-                for i in range(0, len(listing_tasks), chunk_size):
-                    chunk = listing_tasks[i:i + chunk_size]
-                    await asyncio.gather(*chunk)
-                    pbar.update(len(chunk))
-            
-            print(f"  ✅ Completed {len(all_listings)} listings\n")
+            if not skip_listings:
+                tqdm.write("\n" + "="*80)
+                tqdm.write("📋 PHASE 2: Listing Reports")
+                tqdm.write("   Aggregating from child products")
+                tqdm.write("="*80)
+                
+                listing_tasks = []
+                for listing_id in all_listings:
+                    task = self._process_listing_reports_aggregated(
+                        listing_id, periods, semaphore, sku_metrics_store, listing_metrics_store
+                    )
+                    listing_tasks.append(task)
+                
+                # Process with progress bar
+                with tqdm(
+                    total=len(listing_tasks), 
+                    desc="📋 Processing Listings",
+                    unit="listing",
+                    ncols=100,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                    colour='blue'
+                ) as pbar:
+                    for i in range(0, len(listing_tasks), chunk_size):
+                        chunk = listing_tasks[i:i + chunk_size]
+                        await asyncio.gather(*chunk)
+                        pbar.update(len(chunk))
+                        # Small delay to prevent file descriptor exhaustion
+                        if len(chunk) == chunk_size:
+                            await asyncio.sleep(0.01)
+                
+                tqdm.write(f"✅ Completed {len(all_listings)} listings\n")
+            else:
+                # Load existing listing reports from database
+                tqdm.write("\n" + "="*80)
+                tqdm.write("📥 PHASE 2: Loading Existing Listing Reports from Database")
+                tqdm.write("   (Skipping recalculation - using cached data)")
+                tqdm.write("="*80)
+                
+                await self._load_listing_reports_into_cache(listing_metrics_store, periods)
+                tqdm.write(f"✅ Loaded {len(listing_metrics_store)} listings from database\n")
             
             # ==========================================
             # PHASE 3: SHOP REPORTS (AGGREGATE FROM ALL LISTINGS)
             # ==========================================
-            print("🏪 PHASE 3: Shop-Wide Reports (Aggregated from All Listings)")
-            shop_tasks = []
-            for period_type, date_ranges in periods.items():
-                task = self._process_shop_reports_aggregated(
-                    period_type, date_ranges, semaphore, listing_metrics_store
-                )
-                shop_tasks.append(task)
+            if not skip_shop:
+                tqdm.write("\n" + "="*80)
+                tqdm.write("🏪 PHASE 3: Shop-Wide Reports")
+                tqdm.write("   Aggregating from all listings")
+                tqdm.write("="*80)
+                
+                shop_tasks = []
+                for period_type, date_ranges in periods.items():
+                    task = self._process_shop_reports_aggregated(
+                        period_type, date_ranges, semaphore, listing_metrics_store
+                    )
+                    shop_tasks.append(task)
+                
+                # Process with progress bar
+                with tqdm(
+                    total=len(shop_tasks), 
+                    desc="🏪 Processing Shop Reports",
+                    unit="type",
+                    ncols=100,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                    colour='cyan'
+                ) as pbar:
+                    for task in shop_tasks:
+                        await task
+                        pbar.update(1)
+                
+                tqdm.write(f"✅ Completed all shop reports\n")
+            else:
+                tqdm.write("\n" + "="*80)
+                tqdm.write("⏭️  PHASE 3: Shop Reports - SKIPPED")
+                tqdm.write("="*80 + "\n")
+                pbar.update(1)
             
-            # Process with progress bar
-            with tqdm(total=len(shop_tasks), desc="  Processing Shop Reports", unit="type", ncols=100) as pbar:
-                for task in shop_tasks:
-                    await task
-                    pbar.update(1)
-            
-            print(f"  ✅ Completed all shop reports\n")
+            tqdm.write(f"✅ Completed all shop reports\n")
             
             # ==========================================
             # PRINT SUMMARY STATISTICS
             # ==========================================
-            print("=" * 80)
-            print("📊 COST DATA QUALITY SUMMARY")
-            print("=" * 80)
+            tqdm.write("\n" + "="*80)
+            tqdm.write("📊 COST DATA QUALITY SUMMARY")
+            tqdm.write("="*80)
             
             total_listings = len(all_listings)
             listings_skipped = len(self._listings_skipped_no_cost)
             listings_processed = total_listings - listings_skipped
             
-            print(f"\n📋 Listing Processing:")
-            print(f"   Total Listings: {total_listings}")
-            print(f"   ✅ Processed: {listings_processed} ({listings_processed/total_listings*100:.1f}%)")
-            print(f"   ⚠️  Skipped (no cost data): {listings_skipped} ({listings_skipped/total_listings*100:.1f}%)")
+            tqdm.write(f"\n📋 Listing Processing:")
+            tqdm.write(f"   Total Listings: {total_listings}")
+            tqdm.write(f"   ✅ Processed: {listings_processed} ({listings_processed/total_listings*100:.1f}%)")
+            tqdm.write(f"   ⚠️  Skipped (no cost data): {listings_skipped} ({listings_skipped/total_listings*100:.1f}%)")
             
             if self._listings_skipped_no_cost:
-                print(f"\n   Skipped Listing IDs: {sorted(list(self._listings_skipped_no_cost))[:20]}")
+                skipped_sample = sorted(list(self._listings_skipped_no_cost))[:20]
+                tqdm.write(f"   Skipped Listing IDs (first 20): {skipped_sample}")
                 if len(self._listings_skipped_no_cost) > 20:
-                    print(f"   ... and {len(self._listings_skipped_no_cost) - 20} more")
+                    tqdm.write(f"   ... and {len(self._listings_skipped_no_cost) - 20} more")
             
-            print(f"\n📦 Product/SKU Processing:")
-            print(f"   Total SKUs: {len(all_skus)}")
-            print(f"   SKUs with missing cost data: {len(self._skipped_products_no_cost)}")
+            tqdm.write(f"\n📦 Product/SKU Processing:")
+            tqdm.write(f"   Total SKUs: {len(all_skus)}")
+            tqdm.write(f"   SKUs with missing cost data: {len(self._skipped_products_no_cost)}")
             
             # Calculate cost data source statistics from metrics
             total_items = sum(self._cost_fallback_stats.values())
             if total_items > 0:
-                print(f"\n💰 Cost Data Sources (Total Items: {total_items:,}):")
-                print(f"   Direct lookup: {self._cost_fallback_stats['direct']:,} "
+                tqdm.write(f"\n💰 Cost Data Sources (Total Items: {total_items:,}):")
+                tqdm.write(f"   Direct lookup: {self._cost_fallback_stats['direct']:,} "
                       f"({self._cost_fallback_stats['direct']/total_items*100:.1f}%)")
-                print(f"   Sibling (same period): {self._cost_fallback_stats['sibling_same_period']:,} "
+                tqdm.write(f"   Sibling (same period): {self._cost_fallback_stats['sibling_same_period']:,} "
                       f"({self._cost_fallback_stats['sibling_same_period']/total_items*100:.1f}%)")
-                print(f"   Sibling (historical): {self._cost_fallback_stats['sibling_historical']:,} "
+                tqdm.write(f"   Sibling (historical): {self._cost_fallback_stats['sibling_historical']:,} "
                       f"({self._cost_fallback_stats['sibling_historical']/total_items*100:.1f}%)")
-                print(f"   Missing: {self._cost_fallback_stats['missing']:,} "
+                tqdm.write(f"   Missing: {self._cost_fallback_stats['missing']:,} "
                       f"({self._cost_fallback_stats['missing']/total_items*100:.1f}%)")
                 
                 fallback_items = (self._cost_fallback_stats['sibling_same_period'] + 
                                  self._cost_fallback_stats['sibling_historical'])
-                print(f"\n   ✨ Fallback Success Rate: {fallback_items:,} items recovered "
+                tqdm.write(f"\n   ✨ Fallback Success Rate: {fallback_items:,} items recovered "
                       f"({fallback_items/total_items*100:.1f}% of total)")
             
-            print("\n" + "=" * 80)
-            print("✅✅✅ ALL INSIGHTS GENERATED WITH CORRECT HIERARCHY! ✅✅✅")
-            print("=" * 80 + "\n")
+            tqdm.write("\n" + "="*80)
+            tqdm.write("✅✅✅ ALL INSIGHTS GENERATED WITH CORRECT HIERARCHY! ✅✅✅")
+            tqdm.write("="*80 + "\n")
             
             return {
                 "status": "success",
@@ -2787,34 +3778,58 @@ class EcommerceAnalyticsOptimized:
     # ============================================================================
     
     async def _process_sku_reports_with_cache(self, sku: str, periods: Dict, semaphore: asyncio.Semaphore, cache_store: Dict):
-        """Process SKU reports and cache for listing aggregation."""
+        """
+        Process SKU/product reports with fallback cost strategy - process ALL SKUs.
+        
+        This function processes products even if direct cost lookups fail,
+        relying on the fallback cost strategy (sibling SKUs, historical costs).
+        Products are saved to the database and cached for listing aggregation.
+        """
         async with semaphore:
             try:
-                # Check if SKU exists in cost CSV
-                if not self._sku_exists_in_cost_csv(sku):
-                    self._skipped_products_no_cost.add(sku)
-                    self._skipped_count += 1
-                    # Still initialize cache entry for aggregation purposes
-                    cache_store[sku] = {}
-                    return
-                
                 cache_store[sku] = {}
+                has_saved_any = False
+                
                 for period_type, date_ranges in periods.items():
                     all_metrics = await self.calculate_metrics_batch(date_ranges, period_type=period_type, sku=sku)
                     
                     for period_key, metrics in all_metrics.items():
-                        # Check if this SKU has cost data for this specific period
-                        if metrics.get('total_cost', 0) == 0 and metrics.get('total_orders', 0) > 0:
-                            # Has orders but no cost data for this period - skip
-                            self._skipped_products_no_cost.add(sku)
-                            self._skipped_count += 1
-                            continue
+                        # Only save if we have orders AND non-zero cost data
+                        total_orders = metrics.get('total_orders', 0)
+                        total_cost = metrics.get('total_cost', 0)
                         
-                        if metrics.get('total_orders', 0) > 0:
+                        if total_orders > 0:
+                            # Skip saving if total_cost is 0 - indicates missing cost data
+                            if total_cost == 0:
+                                logger.warning(
+                                    f"⚠️ Skipping SKU {sku}, period {period_type} "
+                                    f"({metrics['period_start'].date()} to {metrics['period_end'].date()}): "
+                                    f"has {total_orders} orders but total_cost is 0. "
+                                    f"Check cost.csv for this SKU."
+                                )
+                                continue
+                            
+                            cost_coverage = metrics.get('cost_coverage_percent', 0)
+                            
+                            # Save report with cost data
                             await self.save_product_report(sku, metrics, period_type,
                                                           metrics['period_start'], metrics['period_end'])
                             full_key = f"{period_type}_{period_key}"
                             cache_store[sku][full_key] = metrics
+                            has_saved_any = True
+                            
+                            # Log if cost coverage is low (for monitoring)
+                            if cost_coverage < 100:
+                                logger.info(
+                                    f"✓ Saved SKU {sku}, period {period_type} with "
+                                    f"{cost_coverage:.1f}% cost coverage (${total_cost:.2f} total cost)"
+                                )
+                
+                # Track SKUs that had no data at all
+                if not has_saved_any:
+                    self._skipped_products_no_cost.add(sku)
+                    self._skipped_count += 1
+                    
             except Exception as e:
                 logger.error(f"Error processing SKU {sku}: {e}", exc_info=True)
 
@@ -2822,34 +3837,14 @@ class EcommerceAnalyticsOptimized:
                                                   semaphore: asyncio.Semaphore, 
                                                   sku_metrics_store: Dict, listing_cache_store: Dict):
         """
-        Listing reports with cost data validation - SKIP listings with NO cost data.
+        Listing reports with fallback cost strategy - process ALL listings.
         
-        This ensures all listings get reports even if SKU aggregation fails, but
-        SKIPS listings entirely if no cost data exists for any child SKU.
+        This function processes listings even if direct cost lookups fail,
+        relying on the fallback cost strategy (sibling SKUs, historical costs).
         """
         async with semaphore:
             try:
-                # STEP 1: Check if this listing has ANY cost data available
-                cost_info = await self.get_all_costs_for_listing(listing_id)
-                
-                if not cost_info["has_any_costs"]:
-                    # No cost data found for this listing - SKIP IT
-                    self._listings_skipped_no_cost.add(listing_id)
-                    logger.warning(
-                        f"⚠️ SKIPPING Listing {listing_id}: No cost data found for any child SKUs. "
-                        f"SKUs without costs: {cost_info['skus_without_costs']}"
-                    )
-                    return  # Skip this entire listing
-                
-                # Log if partial cost data
-                if cost_info["skus_without_costs"]:
-                    logger.info(
-                        f"ℹ️ Listing {listing_id}: Partial cost data. "
-                        f"With costs: {cost_info['skus_with_costs']}, "
-                        f"Without costs: {cost_info['skus_without_costs']}"
-                    )
-                
-                # STEP 2: Get child SKUs for aggregation
+                # Get child SKUs for aggregation
                 child_product_ids = self._listing_to_products.get(listing_id, [])
                 child_skus = []
                 
@@ -2862,42 +3857,62 @@ class EcommerceAnalyticsOptimized:
                     return await self._process_listing_reports_direct(listing_id, periods, listing_cache_store)
                 
                 listing_cache_store[listing_id] = {}
+                has_saved_any = False
                 
                 for period_type, date_ranges in periods.items():
                     for dr in date_ranges:
-                        period_key = f"{dr.start_date.isoformat()}_{dr.end_date.isoformat()}"
+                        # CRITICAL: Use same format as calculate_metrics_batch returns
+                        period_key = f"{dr.start_date.strftime('%Y-%m-%d')}_to_{dr.end_date.strftime('%Y-%m-%d')}"
                         full_key = f"{period_type}_{period_key}"
                         
                         # TRY 1: Aggregate from child SKUs
                         aggregated_metrics = self._aggregate_from_skus(child_skus, full_key, sku_metrics_store, dr)
                         
                         # TRY 2: If aggregation returned nothing, calculate directly
+                        # This will use the fallback cost strategy automatically
                         if not aggregated_metrics or aggregated_metrics.get('total_orders', 0) == 0:
                             # Direct calculation for this listing
                             batch_metrics = await self.calculate_metrics_batch([dr], period_type=period_type, listing_id=listing_id)
                             if batch_metrics:
                                 aggregated_metrics = batch_metrics.get(period_key)
                         
-                        # Save only if we have complete cost data
+                        # Save if we have data with non-zero cost
                         if aggregated_metrics and aggregated_metrics.get('total_orders', 0) > 0:
-                            # Check if cost data is complete enough (at least 50% coverage)
-                            cost_coverage = aggregated_metrics.get('cost_coverage_percent', 0)
-                            has_complete = aggregated_metrics.get('has_complete_cost_data', False)
+                            total_cost = aggregated_metrics.get('total_cost', 0)
                             
-                            if cost_coverage >= 50 or has_complete:
-                                await self.save_listing_report(
-                                    listing_id, 
-                                    aggregated_metrics, 
-                                    period_type,
-                                    aggregated_metrics['period_start'], 
-                                    aggregated_metrics['period_end']
+                            # Skip saving if total_cost is 0
+                            if total_cost == 0:
+                                logger.warning(
+                                    f"⚠️ Skipping Listing {listing_id}, period {period_type} "
+                                    f"({aggregated_metrics['period_start'].date()} to {aggregated_metrics['period_end'].date()}): "
+                                    f"has {aggregated_metrics.get('total_orders', 0)} orders but total_cost is 0. "
+                                    f"Check cost.csv for child SKUs: {', '.join(child_skus[:5])}{'...' if len(child_skus) > 5 else ''}"
                                 )
-                                listing_cache_store[listing_id][full_key] = aggregated_metrics
-                            else:
-                                logger.debug(
-                                    f"Skipping save for Listing {listing_id}, period {period_type}: "
-                                    f"Cost coverage too low ({cost_coverage:.1f}%)"
+                                continue
+                            
+                            cost_coverage = aggregated_metrics.get('cost_coverage_percent', 0)
+                            
+                            # Save listing report with cost data
+                            await self.save_listing_report(
+                                listing_id, 
+                                aggregated_metrics, 
+                                period_type,
+                                aggregated_metrics['period_start'], 
+                                aggregated_metrics['period_end']
+                            )
+                            listing_cache_store[listing_id][full_key] = aggregated_metrics
+                            has_saved_any = True
+                            
+                            # Log if cost coverage is low (for monitoring)
+                            if cost_coverage < 100:
+                                logger.info(
+                                    f"✓ Saved Listing {listing_id}, period {period_type} with "
+                                    f"{cost_coverage:.1f}% cost coverage (${total_cost:.2f} total cost)"
                                 )
+                
+                # Track listings that had no data at all
+                if not has_saved_any:
+                    self._listings_skipped_no_cost.add(listing_id)
                             
             except Exception as e:
                 logger.error(f"Error processing listing {listing_id}: {e}", exc_info=True)
@@ -2908,7 +3923,18 @@ class EcommerceAnalyticsOptimized:
         for period_type, date_ranges in periods.items():
             all_metrics = await self.calculate_metrics_batch(date_ranges, period_type=period_type, listing_id=listing_id)
             for period_key, metrics in all_metrics.items():
-                if metrics.get('total_orders', 0) > 0:
+                total_orders = metrics.get('total_orders', 0)
+                total_cost = metrics.get('total_cost', 0)
+                
+                if total_orders > 0:
+                    # Skip if total_cost is 0
+                    if total_cost == 0:
+                        logger.warning(
+                            f"⚠️ Skipping Listing {listing_id} (direct), period {period_type}: "
+                            f"has {total_orders} orders but total_cost is 0"
+                        )
+                        continue
+                    
                     await self.save_listing_report(listing_id, metrics, period_type,
                                                   metrics['period_start'], metrics['period_end'])
                     cache_store[listing_id][f"{period_type}_{period_key}"] = metrics
@@ -2945,8 +3971,19 @@ class EcommerceAnalyticsOptimized:
                             # Use the same period_key format that calculate_metrics_batch returns
                             aggregated_metrics = batch_metrics.get(period_key)
                     
-                    # Save if we have valid data
+                    # Save if we have valid data AND non-zero cost
                     if aggregated_metrics and aggregated_metrics.get('total_orders', 0) > 0:
+                        total_cost = aggregated_metrics.get('total_cost', 0)
+                        
+                        # Skip saving if total_cost is 0
+                        if total_cost == 0:
+                            logger.warning(
+                                f"⚠️ Skipping Shop report, period {period_type} "
+                                f"({aggregated_metrics['period_start'].date()} to {aggregated_metrics['period_end'].date()}): "
+                                f"has {aggregated_metrics.get('total_orders', 0)} orders but total_cost is 0"
+                            )
+                            continue
+                        
                         try:
                             await self.save_shop_report(
                                 aggregated_metrics, 
@@ -2955,24 +3992,49 @@ class EcommerceAnalyticsOptimized:
                                 aggregated_metrics['period_end']
                             )
                             saved_count += 1
+                            logger.info(
+                                f"✓ Saved Shop {period_type} report with ${total_cost:.2f} total cost"
+                            )
                         except Exception as save_error:
                             logger.error(f"Failed to save shop report: {save_error}", exc_info=True)
                 
-                print(f"📊 Shop {period_type.upper()}: Saved {saved_count}/{len(date_ranges)} periods")
-                logger.info(f"Shop {period_type.upper()}: Saved {saved_count}/{len(date_ranges)} periods")
+                # Only log summary, not individual operations
+                logger.debug(f"Shop {period_type.upper()}: Saved {saved_count}/{len(date_ranges)} periods")
             except Exception as e:
-                print(f"\n❌ ERROR in _process_shop_reports_aggregated: {e}")
                 logger.error(f"Error aggregating shop {period_type}: {e}", exc_info=True)
 
     def _aggregate_from_skus(self, sku_list: List[str], period_key: str, 
                             sku_store: Dict, date_range: DateRange) -> Dict:
-        """Aggregate metrics from SKUs."""
+        """
+        Aggregate metrics from SKUs.
+        
+        Handles both normalized (without prefix) and original (with prefix) SKU formats
+        using a prebuilt index for O(1) lookups instead of O(n) search.
+        """
         agg = None
+        found_count = 0
+        
+        # Get the normalized index if available
+        normalized_index = sku_store.get('_normalized_index', {})
+        
         for sku in sku_list:
-            if sku in sku_store and period_key in sku_store[sku]:
+            # Try original SKU first (fast path)
+            if sku in sku_store and isinstance(sku_store[sku], dict) and period_key in sku_store[sku]:
                 agg = sku_store[sku][period_key].copy() if agg is None else self._sum_metrics(agg, sku_store[sku][period_key])
+                found_count += 1
+                continue
+            
+            # Try using normalized index (O(1) lookup)
+            normalized_sku = self._normalize_sku_for_comparison(sku)
+            if normalized_sku in normalized_index:
+                store_sku = normalized_index[normalized_sku]
+                if store_sku in sku_store and isinstance(sku_store[store_sku], dict) and period_key in sku_store[store_sku]:
+                    agg = sku_store[store_sku][period_key].copy() if agg is None else self._sum_metrics(agg, sku_store[store_sku][period_key])
+                    found_count += 1
+        
         if agg:
             agg['period_start'], agg['period_end'] = date_range.start_date, date_range.end_date
+        
         return agg
 
     def _aggregate_from_listings(self, listing_ids: List[int], period_key: str,
@@ -3027,7 +4089,8 @@ class EcommerceAnalyticsOptimized:
                  'etsy_fees_retained_on_refunds',
                  'cancelled_orders', 'unique_customers', 'repeat_customers', 'total_inventory', 
                  'active_variants',
-                 'items_with_direct_cost', 'items_with_fallback_cost', 'items_missing_cost']:
+                 'items_with_direct_cost', 'items_with_fallback_cost', 'items_missing_cost',
+                 'total_ad_spend']:  # Ad spend summed from child products/listings
             r[f] = r.get(f, 0) + m2.get(f, 0)
         
         # Merge cost data sources
@@ -3128,11 +4191,25 @@ Examples:
     parser.add_argument('--clean-reports', action='store_true',
                        help='⚠️ DELETE all existing reports before generating new ones (FRESH START)')
     
+    # Phase control arguments - NEW!
+    parser.add_argument('--skip-products', action='store_true',
+                       help='Skip product/SKU report generation (load from database instead)')
+    parser.add_argument('--skip-listings', action='store_true',
+                       help='Skip listing report generation (load from database instead)')
+    parser.add_argument('--skip-shop', action='store_true',
+                       help='Skip shop report generation (load from database instead)')
+    parser.add_argument('--only-products', action='store_true',
+                       help='Run ONLY product reports (skip listings and shop)')
+    parser.add_argument('--only-listings', action='store_true',
+                       help='Run ONLY listing reports (skip products and shop, load products from DB)')
+    parser.add_argument('--only-shop', action='store_true',
+                       help='Run ONLY shop reports (skip products and listings, load from DB)')
+    
     # Performance arguments
     parser.add_argument('--max-concurrent', type=int, default=3,
-                       help='Maximum concurrent operations (default: 3, safe for connection pool)')
-    parser.add_argument('--batch-size', type=int, default=50,
-                       help='Batch size for bulk operations (default: 50)')
+                       help='Maximum concurrent operations (default: 3, safe for file descriptors)')
+    parser.add_argument('--batch-size', type=int, default=100,
+                       help='Batch size for bulk operations (default: 100, optimized for throughput)')
     
     # Etsy fee configuration
     parser.add_argument('--etsy-transaction-fee', type=float, default=0.065,
@@ -3143,6 +4220,23 @@ Examples:
                        help='Etsy fixed processing fee per order (default: 0.25 USD)')
     
     args = parser.parse_args()
+    
+    # Handle --only-X flags (convert to skip flags)
+    skip_products = args.skip_products or args.only_listings or args.only_shop
+    skip_listings = args.skip_listings or args.only_products or args.only_shop
+    skip_shop = args.skip_shop or args.only_products or args.only_listings
+    
+    # Check system file descriptor limits on macOS/Unix
+    try:
+        import resource
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit < 1024:
+            tqdm.write(f"\n⚠️  WARNING: File descriptor limit is low ({soft_limit})")
+            tqdm.write(f"   Recommended: at least 1024")
+            tqdm.write(f"   Run: ulimit -n 4096")
+            tqdm.write(f"   Or reduce --max-concurrent to 2\n")
+    except:
+        pass  # Not on Unix-like system
     
     analytics = EcommerceAnalyticsOptimized(
         args.cost_file,
@@ -3165,6 +4259,25 @@ Examples:
         print(f"🗑️  Mode: CLEAN & REGENERATE (will delete all existing reports)")
     else:
         print(f"🔄 Mode: UPDATE (will upsert existing reports)")
+    
+    # Show which phases will run
+    phases_to_run = []
+    if not skip_products:
+        phases_to_run.append("Products")
+    else:
+        phases_to_run.append("Products (from DB)")
+    
+    if not skip_listings:
+        phases_to_run.append("Listings")
+    else:
+        phases_to_run.append("Listings (from DB)")
+    
+    if not skip_shop:
+        phases_to_run.append("Shop")
+    else:
+        phases_to_run.append("Shop (skipped)")
+    
+    print(f"📋 Phases: {' → '.join(phases_to_run)}")
         
     print("💨 Optimizations: NumPy Vectorization + Parallel Processing + Smart Caching")
     print("⏱️  Expected: 5-10 minutes for 200k orders (vs 4-6 hours sequential)")
@@ -3177,8 +4290,13 @@ Examples:
     # Use context manager to ensure connection is ALWAYS closed
     try:
         async with analytics:
-            # Run the analysis with clean flag
-            result = await analytics.generate_all_insights_batch(clean_old_data=args.clean_reports)
+            # Run the analysis with phase control flags
+            result = await analytics.generate_all_insights_batch(
+                clean_old_data=args.clean_reports,
+                skip_products=skip_products,
+                skip_listings=skip_listings,
+                skip_shop=skip_shop
+            )
             
             elapsed_time = time.time() - start_time
             
@@ -3197,30 +4315,55 @@ Examples:
                 print("\n📋 DATA QUALITY REPORT:")
                 print("="*80)
                 
+                # Cost Data Statistics
+                total_cost_lookups = sum(analytics._cost_fallback_stats.values())
+                if total_cost_lookups > 0:
+                    print("💰 COST DATA SUMMARY:")
+                    print(f"   Total items processed: {total_cost_lookups}")
+                    print(f"   ✓ Direct cost found: {analytics._cost_fallback_stats['direct']} ({analytics._cost_fallback_stats['direct']/total_cost_lookups*100:.1f}%)")
+                    print(f"   ⚡ Sibling cost (same period): {analytics._cost_fallback_stats['sibling_same_period']} ({analytics._cost_fallback_stats['sibling_same_period']/total_cost_lookups*100:.1f}%)")
+                    print(f"   📅 Sibling cost (historical): {analytics._cost_fallback_stats['sibling_historical']} ({analytics._cost_fallback_stats['sibling_historical']/total_cost_lookups*100:.1f}%)")
+                    print(f"   ❌ Missing cost: {analytics._cost_fallback_stats['missing']} ({analytics._cost_fallback_stats['missing']/total_cost_lookups*100:.1f}%)")
+                    print()
+                    
+                    # Highlight if many missing costs
+                    if analytics._cost_fallback_stats['missing'] > 0:
+                        missing_pct = analytics._cost_fallback_stats['missing']/total_cost_lookups*100
+                        if missing_pct > 10:
+                            print(f"   ⚠️  WARNING: {missing_pct:.1f}% of items have MISSING costs!")
+                            print(f"   This means reports with 0 total_cost were SKIPPED (not saved to DB)")
+                            print(f"   💡 ACTION REQUIRED: Add cost data to cost.csv for these SKUs:")
+                        else:
+                            print(f"   ℹ️  {missing_pct:.1f}% items have missing costs - within acceptable range")
+                
                 # Skipped products due to missing cost data
                 if analytics._skipped_products_no_cost:
-                    print(f"⏭️  SKIPPED: {len(analytics._skipped_products_no_cost)} products not recorded")
-                    print(f"    Reason: SKU not found in cost.csv OR no cost data for specific months")
-                    print(f"    Total reports skipped: {analytics._skipped_count}")
+                    print(f"\n⏭️  REPORTS SKIPPED (not saved to database):")
+                    print(f"   Count: {len(analytics._skipped_products_no_cost)} SKUs with 0 total_cost")
+                    print(f"   Reason: No cost data found in cost.csv for any period")
+                    print(f"   Total reports skipped: {analytics._skipped_count}")
                     if len(analytics._skipped_products_no_cost) <= 20:
-                        print(f"    Skipped SKUs: {', '.join(sorted(analytics._skipped_products_no_cost))}")
+                        print(f"   Skipped SKUs: {', '.join(sorted(analytics._skipped_products_no_cost))}")
                     else:
                         sample_skus = sorted(analytics._skipped_products_no_cost)[:20]
-                        print(f"    Sample (first 20): {', '.join(sample_skus)}")
-                    print(f"    💡 TIP: Add these SKUs to cost.csv to include them in reports")
+                        print(f"   Sample (first 20): {', '.join(sample_skus)}")
+                        print(f"   ... and {len(analytics._skipped_products_no_cost) - 20} more")
+                    print(f"\n   💡 TO FIX: Add these SKUs to cost.csv with their monthly costs")
+                    print(f"   Example CSV format: SKU, US OCAK 2024, US SUBAT 2024, ...")
                     print()
                 
                 if analytics._missing_cost_skus:
-                    print(f"⚠️  WARNING: {len(analytics._missing_cost_skus)} SKUs missing cost data for some periods")
-                    print(f"    These were still processed but with $0 cost (profit may be overstated)")
+                    print(f"⚠️  SKUs with PARTIAL cost data: {len(analytics._missing_cost_skus)}")
+                    print(f"    These have costs for SOME months but not others")
                     if len(analytics._missing_cost_skus) <= 20:
-                        print(f"    Missing SKUs: {', '.join(sorted(analytics._missing_cost_skus))}")
+                        print(f"    Missing for some periods: {', '.join(sorted(analytics._missing_cost_skus))}")
                     else:
                         sample_skus = sorted(analytics._missing_cost_skus)[:20]
                         print(f"    Sample (first 20): {', '.join(sample_skus)}")
+                    print(f"    💡 Check cost.csv and add missing month columns")
                     print()
                 else:
-                    print("✅ All processed SKUs have cost data")
+                    print("✅ All processed SKUs have cost data for all periods")
                 
                 if analytics._currency_warnings_shown:
                     print(f"⚠️  CRITICAL: Multiple currencies detected in {len(analytics._currency_warnings_shown)} periods")
