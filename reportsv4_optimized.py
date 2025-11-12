@@ -81,6 +81,10 @@ class EcommerceAnalyticsOptimized:
         self.max_concurrent = max_concurrent  # Parallel operations limit (safe for file descriptors)
         self.batch_size = batch_size  # Bulk insert batch size (increased from 50)
         
+        # Connection health tracking
+        self._last_connection_check = 0  # Timestamp of last connection health check
+        self._connection_check_interval = 30  # Check connection every 30 seconds max
+        
         # Load shipping-related CSVs
         self.desi_data = self._load_desi_data(desi_csv_path)
         self.fedex_zones_data = self._load_fedex_zones(fedex_zones_csv_path)
@@ -379,6 +383,165 @@ class EcommerceAnalyticsOptimized:
         # Fast lookup using pre-computed normalized column
         return normalized_lookup_sku in self.cost_data['_normalized_sku'].values
 
+    def _get_cost_from_variant_skus(self, sku: str, year: int, month: int) -> float:
+        """
+        Find cost from variant/sibling SKUs when exact SKU is missing.
+        
+        Two-stage fallback strategy:
+        1. EXACT MATCH: Same size/material, different color only
+           Example: OT-PU-L-KeyboardPad-White → OT-PU-L-KeyboardPad-Black ($6.86)
+        
+        2. GENERIC FALLBACK: Remove last segment (color) if no exact match
+           Example: OT-CustomProduct-Blue → OT-CustomProduct (any variant)
+        
+        This ensures Small doesn't use Large costs, but if no size variants exist,
+        it will fall back to any available variant.
+        """
+        if not sku or self.cost_data.empty:
+            return 0.0
+        
+        # Common color suffixes (case-insensitive)
+        color_suffixes = [
+            '-White', '-Black', '-Brown', '-Red', '-Blue', '-Green', '-Yellow', '-Orange',
+            '-Gray', '-Grey', '-Pink', '-Purple', '-Navy', '-Beige', '-Tan', '-Cream',
+            '-DarkBrown', '-LightBrown', '-DarkGray', '-LightGray',
+        ]
+        
+        # STAGE 1: Try exact size/material match with different color
+        base_sku = sku
+        for color in color_suffixes:
+            if base_sku.upper().endswith(color.upper()):
+                base_sku = base_sku[:-len(color)]
+                break
+        
+        normalized_base = self._normalize_sku_for_comparison(base_sku)
+        
+        # Find EXACT matching variants (same base including size/material)
+        matching_variants = []
+        for _, row in self.cost_data.iterrows():
+            csv_sku = str(row.get('SKU', '')).strip()
+            if not csv_sku:
+                continue
+            
+            # Extract base from CSV SKU the same way
+            csv_base = csv_sku
+            for color in color_suffixes:
+                if csv_base.upper().endswith(color.upper()):
+                    csv_base = csv_base[:-len(color)]
+                    break
+            
+            normalized_csv_base = self._normalize_sku_for_comparison(csv_base)
+            
+            # EXACT base match required (same size, material, product)
+            if normalized_csv_base == normalized_base:
+                variant_cost = self._get_cost_from_row(row, year, month)
+                if variant_cost > 0:
+                    matching_variants.append((csv_sku, variant_cost, 'exact'))
+        
+        # Return first exact match if found
+        if matching_variants:
+            best_match_sku, best_cost, match_type = matching_variants[0]
+            logger.info(
+                f"💡 Size-aware variant fallback: Using cost from '{best_match_sku}' "
+                f"(${best_cost:.2f}) for missing SKU '{sku}'"
+            )
+            return best_cost
+        
+        # STAGE 2: Generic fallback - remove last segment after '-' 
+        # This handles cases where SKU ends with color but no exact variants exist
+        if '-' in sku:
+            generic_base = sku.rsplit('-', 1)[0]  # Remove last segment
+            normalized_generic = self._normalize_sku_for_comparison(generic_base)
+            
+            # Find any SKU that starts with this generic base
+            for _, row in self.cost_data.iterrows():
+                csv_sku = str(row.get('SKU', '')).strip()
+                if not csv_sku:
+                    continue
+                
+                normalized_csv = self._normalize_sku_for_comparison(csv_sku)
+                
+                # Match if CSV SKU starts with generic base
+                if normalized_csv.startswith(normalized_generic):
+                    variant_cost = self._get_cost_from_row(row, year, month)
+                    if variant_cost > 0:
+                        logger.info(
+                            f"💡 Generic variant fallback: Using cost from '{csv_sku}' "
+                            f"(${variant_cost:.2f}) for missing SKU '{sku}' (removed last segment)"
+                        )
+                        return variant_cost
+        
+        return 0.0
+    
+    def _get_cost_from_row(self, cost_row, year: int, month: int) -> float:
+        """Extract cost from a cost.csv row for the given year/month."""
+        month_names = {
+            1: "OCAK", 2: "SUBAT", 3: "MART", 4: "NISAN", 5: "MAYIS", 6: "HAZIRAN",
+            7: "TEMMUZ", 8: "AGUSTOS", 9: "EYLUL", 10: "EKIM", 11: "KASIM", 12: "ARALIK",
+        }
+        month_name = month_names.get(month)
+        if not month_name:
+            return 0.0
+
+        prefixes = ["US", "EU", "AU"]
+        year_2digit = year % 100
+        
+        # Try all possible column name formats
+        for prefix in prefixes:
+            possible_columns = [
+                f"{prefix} {month_name} {year}",
+                f"{prefix} {month_name} {year_2digit}",
+                f"{prefix} {year} {month_name}",
+                f"{prefix} {year_2digit} {month_name}",
+                f"{prefix} {month_name}{year_2digit}",
+                f"{prefix}{year_2digit} {month_name}",
+                f"{prefix} {month_name}",
+            ]
+            
+            all_columns = []
+            for col in possible_columns:
+                all_columns.extend([col, f"{col} CALISMA", f"{col} ÇALIŞMA"])
+
+            for col in all_columns:
+                value = cost_row.get(col)
+                if pd.notna(value):
+                    try:
+                        cost = float(value)
+                        if cost > 0:
+                            return cost
+                    except (ValueError, TypeError):
+                        continue
+        
+        # Fallback: try to find most recent cost for this row
+        all_cost_columns = []
+        for prefix in prefixes:
+            for col in cost_row.index if hasattr(cost_row, 'index') else cost_row.keys():
+                if col.startswith(prefix) and any(mn in col for mn in month_names.values()):
+                    all_cost_columns.append(col)
+        
+        dated_costs = []
+        for col in all_cost_columns:
+            value = cost_row.get(col) if hasattr(cost_row, 'get') else cost_row[col]
+            if pd.notna(value):
+                try:
+                    cost = float(value)
+                    if cost > 0:
+                        import re
+                        year_match = re.search(r'\b(20\d{2}|2\d)\b', col)
+                        if year_match:
+                            col_year = int(year_match.group(1))
+                            if col_year < 100:
+                                col_year += 2000
+                            dated_costs.append((col_year, cost, col))
+                except (ValueError, TypeError):
+                    continue
+        
+        if dated_costs:
+            dated_costs.sort(reverse=True)
+            return dated_costs[0][1]
+        
+        return 0.0
+
     @lru_cache(maxsize=10000)
     def get_cost_for_sku_date(self, sku: str, year: int, month: int) -> float:
         """Get cost for a specific SKU at a specific date with bidirectional normalized matching."""
@@ -398,6 +561,11 @@ class EcommerceAnalyticsOptimized:
         matching_rows = self.cost_data[self.cost_data['_normalized_sku'] == normalized_lookup_sku]
         
         if matching_rows.empty:
+            # VARIANT FALLBACK: Try to find sibling SKUs (same base product, different color/variant)
+            # Example: OT-PU-L-KeyboardPad-White → find OT-PU-L-KeyboardPad-Black, Brown, etc.
+            variant_cost = self._get_cost_from_variant_skus(sku, year, month)
+            if variant_cost > 0:
+                return variant_cost
             return 0.0
         
         sku_row = matching_rows.iloc[0:1]
@@ -499,13 +667,24 @@ class EcommerceAnalyticsOptimized:
             
             return most_recent_cost
 
+        # Before giving up, try variant fallback (same as when SKU row missing)
+        # This handles cases where the SKU exists in cost.csv but the specific
+        # date columns are empty/zero — we can try siblings by size/color.
+        try:
+            variant_cost = self._get_cost_from_variant_skus(sku, year, month)
+            if variant_cost > 0:
+                return variant_cost
+        except Exception:
+            # Don't break on fallback errors; continue to missing handling
+            pass
+
         # Track missing cost data for warnings
         if sku not in self._missing_cost_skus:
             self._missing_cost_skus.add(sku)
             # Only log first few to avoid spam
             if len(self._missing_cost_skus) <= 10:
                 logger.warning(f"⚠️ No cost data found for SKU: {sku} (year: {year}, month: {month})")
-        
+
         return 0.0
 
     async def get_cost_with_fallback(
@@ -992,7 +1171,7 @@ class EcommerceAnalyticsOptimized:
             # Set statement timeout to prevent long-running queries from blocking
             # 5 minutes should be enough for any reasonable query
             try:
-                await self.prisma.execute_raw("SET statement_timeout = '300000'")  # 5 minutes in milliseconds
+                await self.prisma.execute_raw("SET statement_timeout = '3600000'")  # 5 minutes in milliseconds
                 logger.info("✓ Statement timeout set to 5 minutes")
             except Exception as timeout_error:
                 logger.warning(f"Could not set statement timeout: {timeout_error}")
@@ -1009,17 +1188,168 @@ class EcommerceAnalyticsOptimized:
             raise
     
     async def _ensure_connection(self):
-        """Ensure database connection is healthy, reconnect if needed."""
-        try:
-            if not self.prisma.is_connected():
-                logger.warning("⚠️ Database connection lost, reconnecting...")
-                await self.prisma.connect()
-                # Reset statement timeout after reconnection
-                await self.prisma.execute_raw("SET statement_timeout = '300000'")
-                logger.info("✓ Database reconnected successfully")
-        except Exception as e:
-            logger.error(f"Failed to ensure database connection: {e}")
-            raise
+        """
+        Ensure database connection is healthy, reconnect if needed.
+        Uses timestamp-based throttling to avoid excessive connection checks.
+        """
+        import time
+        
+        # Check if we recently verified the connection (within last 30 seconds)
+        current_time = time.time()
+        if current_time - self._last_connection_check < self._connection_check_interval:
+            return  # Connection was recently checked, assume it's still healthy
+        
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # First check if connection exists
+                if not self.prisma.is_connected():
+                    logger.warning("⚠️ Database connection lost, reconnecting...")
+                    await self.prisma.connect()
+                    await self.prisma.execute_raw("SET statement_timeout = '300000'")
+                    logger.info("✓ Database reconnected successfully")
+                
+                # Test the connection with a simple query (acts as keep-alive)
+                await self.prisma.query_raw("SELECT 1")
+                
+                # Update last check timestamp
+                self._last_connection_check = current_time
+                return  # Connection is healthy
+                
+            except Exception as e:
+                error_str = str(e)
+                
+                # Check if it's a connection closed error
+                if "Closed" in error_str or "closed" in error_str.lower():
+                    logger.warning(f"Connection closed by server, forcing reconnect (attempt {attempt + 1}/{max_retries})")
+                else:
+                    logger.warning(f"Connection check failed (attempt {attempt + 1}/{max_retries}): {e}")
+                
+                # Try to disconnect and reconnect
+                try:
+                    if self.prisma.is_connected():
+                        await self.prisma.disconnect()
+                except:
+                    pass
+                
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    try:
+                        await self.prisma.connect()
+                        await self.prisma.execute_raw("SET statement_timeout = '300000'")
+                        self._last_connection_check = time.time()  # Update timestamp after successful reconnect
+                        logger.info("✓ Database reconnected after retry")
+                    except Exception as reconnect_error:
+                        logger.error(f"Reconnection failed: {reconnect_error}")
+                else:
+                    logger.error(f"Failed to ensure database connection after {max_retries} attempts")
+                    raise
+
+    async def _retry_on_connection_error(self, operation, *args, max_retries=3, **kwargs):
+        """
+        Wrapper to retry database operations on connection failures.
+        
+        Args:
+            operation: The async function to execute
+            max_retries: Number of retry attempts
+            *args, **kwargs: Arguments to pass to the operation
+            
+        Returns:
+            Result from the operation
+        """
+        retry_delay = 1
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                await self._ensure_connection()
+                return await operation(*args, **kwargs)
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                error_type = type(e).__name__
+                
+                # Check if it's a connection error (comprehensive detection)
+                is_connection_error = (
+                    # Prisma-specific errors
+                    "Can't reach database server" in error_str or
+                    "ClientNotConnectedError" in error_type or
+                    "not connected" in error_str.lower() or
+                    "already connected" in error_str.lower() or
+                    
+                    # PostgreSQL errors
+                    "Connection" in error_str or
+                    "Closed" in error_str or
+                    "connection refused" in error_str.lower() or
+                    "connection reset" in error_str.lower() or
+                    "connection timed out" in error_str.lower() or
+                    "connection lost" in error_str.lower() or
+                    "connection aborted" in error_str.lower() or
+                    "connection closed" in error_str.lower() or
+                    "broken pipe" in error_str.lower() or
+                    
+                    # Network errors
+                    "ConnectError" in error_type or  # httpcore.ConnectError
+                    "NetworkError" in error_type or
+                    "TimeoutError" in error_type or
+                    "OSError" in error_type or
+                    "socket" in error_str.lower() or
+                    "All connection attempts failed" in error_str or
+                    
+                    # Server errors
+                    "server closed the connection" in error_str.lower() or
+                    "server is not responding" in error_str.lower() or
+                    "too many connections" in error_str.lower() or
+                    "pool exhausted" in error_str.lower() or
+                    
+                    # SSL/TLS errors
+                    "ssl" in error_str.lower() or
+                    "tls" in error_str.lower() or
+                    "certificate" in error_str.lower()
+                )
+                
+                if is_connection_error:
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"Database connection error: {error_type} - {error_str} "
+                            f"(attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s..."
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        
+                        # Force reconnection
+                        try:
+                            # First, disconnect if currently connected
+                            if self.prisma.is_connected():
+                                await self.prisma.disconnect()
+                                logger.debug("Disconnected stale connection")
+                        except Exception as disconnect_error:
+                            logger.debug(f"Error during disconnect: {disconnect_error}")
+                        
+                        # Now reconnect (only if not already connected)
+                        try:
+                            if not self.prisma.is_connected():
+                                await self.prisma.connect()
+                                await self.prisma.execute_raw("SET statement_timeout = '300000'")
+                                self._last_connection_check = 0  # Reset check timestamp to force immediate verification
+                                logger.info("✓ Reconnected to database")
+                            else:
+                                logger.debug("Connection already established, skipping reconnect")
+                        except Exception as reconnect_error:
+                            logger.error(f"Failed to reconnect: {reconnect_error}")
+                        
+                        continue
+                    else:
+                        logger.error(f"Database operation failed after {max_retries} attempts: {error_str}")
+                        raise
+                else:
+                    # Not a connection error, don't retry
+                    raise
+        
+        raise last_error
 
     async def disconnect(self):
         """Disconnect from the Prisma database and clean up resources."""
@@ -1311,97 +1641,101 @@ class EcommerceAnalyticsOptimized:
             await self._ensure_connection()
             
             # Get all product reports using raw SQL (much faster than ORM)
+            # NOTE: ProductReport uses camelCase column names (no @map directives)
             query = """
                 SELECT 
                     sku,
-                    period_type,
-                    period_start,
-                    period_end,
-                    period_days,
-                    gross_revenue,
-                    total_revenue,
-                    product_revenue,
-                    total_shipping_revenue,
-                    total_shipping_charged,
-                    actual_shipping_cost,
-                    shipping_profit,
-                    duty_amount,
-                    tax_amount,
-                    fedex_processing_fee,
-                    total_tax_collected,
-                    total_vat_collected,
-                    total_gift_wrap_revenue,
-                    total_discounts_given,
-                    etsy_transaction_fees,
-                    etsy_processing_fees,
-                    total_etsy_fees,
-                    etsy_fee_rate,
-                    net_revenue,
-                    net_revenue_after_refunds,
-                    take_home_rate,
-                    discount_rate,
-                    contribution_margin,
-                    total_cost,
-                    total_cost_with_shipping,
-                    avg_cost_per_item,
-                    cost_per_order,
-                    gross_profit,
-                    gross_margin,
-                    net_profit,
-                    net_margin,
-                    return_on_revenue,
-                    markup_ratio,
-                    total_orders,
-                    total_items,
-                    total_quantity_sold,
-                    unique_skus,
-                    average_order_value,
-                    median_order_value,
+                    "periodType" as period_type,
+                    "periodStart" as period_start,
+                    "periodEnd" as period_end,
+                    "periodDays" as period_days,
+                    "grossRevenue" as gross_revenue,
+                    "totalRevenue" as total_revenue,
+                    "productRevenue" as product_revenue,
+                    "totalShippingRevenue" as total_shipping_revenue,
+                    "totalShippingCharged" as total_shipping_charged,
+                    "actualShippingCost" as actual_shipping_cost,
+                    "shippingProfit" as shipping_profit,
+                    "dutyAmount" as duty_amount,
+                    "taxAmount" as tax_amount,
+                    "fedexProcessingFee" as fedex_processing_fee,
+                    "totalTaxCollected" as total_tax_collected,
+                    "totalVatCollected" as total_vat_collected,
+                    "totalGiftWrapRevenue" as total_gift_wrap_revenue,
+                    "totalDiscountsGiven" as total_discounts_given,
+                    "etsyTransactionFees" as etsy_transaction_fees,
+                    "etsyProcessingFees" as etsy_processing_fees,
+                    "totalEtsyFees" as total_etsy_fees,
+                    "etsyFeeRate" as etsy_fee_rate,
+                    "netRevenue" as net_revenue,
+                    "netRevenueAfterRefunds" as net_revenue_after_refunds,
+                    "takeHomeRate" as take_home_rate,
+                    "discountRate" as discount_rate,
+                    "contributionMargin" as contribution_margin,
+                    "totalCost" as total_cost,
+                    "totalCostWithShipping" as total_cost_with_shipping,
+                    "avgCostPerItem" as avg_cost_per_item,
+                    "costPerOrder" as cost_per_order,
+                    "grossProfit" as gross_profit,
+                    "grossMargin" as gross_margin,
+                    "netProfit" as net_profit,
+                    "netMargin" as net_margin,
+                    "returnOnRevenue" as return_on_revenue,
+                    "markupRatio" as markup_ratio,
+                    "totalOrders" as total_orders,
+                    "totalItems" as total_items,
+                    "totalQuantitySold" as total_quantity_sold,
+                    "uniqueSkus" as unique_skus,
+                    "averageOrderValue" as average_order_value,
+                    "medianOrderValue" as median_order_value,
                     percentile_75_order_value,
                     percentile_25_order_value,
-                    order_value_std,
-                    items_per_order,
-                    revenue_per_item,
-                    profit_per_item,
-                    unique_customers,
-                    repeat_customers,
-                    customer_retention_rate,
-                    revenue_per_customer,
-                    orders_per_customer,
-                    profit_per_customer,
-                    shipped_orders,
-                    shipping_rate,
-                    gift_orders,
-                    gift_rate,
-                    avg_time_between_orders_hours,
-                    orders_per_day,
-                    revenue_per_day,
-                    total_refund_amount,
-                    total_refund_count,
-                    orders_with_refunds,
-                    etsy_fees_retained_on_refunds,
-                    refund_rate_by_order,
-                    refund_rate_by_value,
-                    order_refund_rate,
-                    cancelled_orders,
-                    cancellation_rate,
-                    completion_rate,
-                    primary_payment_method,
-                    payment_method_diversity,
-                    customer_lifetime_value,
-                    payback_period_days,
-                    customer_acquisition_cost,
-                    price_elasticity,
-                    peak_month,
-                    peak_day_of_week,
-                    peak_hour,
-                    seasonality_index,
-                    total_inventory,
-                    avg_price,
-                    price_range,
-                    active_variants,
-                    inventory_turnover,
-                    stockout_risk
+                    "orderValueStd" as order_value_std,
+                    "itemsPerOrder" as items_per_order,
+                    "revenuePerItem" as revenue_per_item,
+                    "profitPerItem" as profit_per_item,
+                    "uniqueCustomers" as unique_customers,
+                    "repeatCustomers" as repeat_customers,
+                    "customerRetentionRate" as customer_retention_rate,
+                    "revenuePerCustomer" as revenue_per_customer,
+                    "ordersPerCustomer" as orders_per_customer,
+                    "profitPerCustomer" as profit_per_customer,
+                    "shippedOrders" as shipped_orders,
+                    "shippingRate" as shipping_rate,
+                    "giftOrders" as gift_orders,
+                    "giftRate" as gift_rate,
+                    "avgTimeBetweenOrdersHours" as avg_time_between_orders_hours,
+                    "ordersPerDay" as orders_per_day,
+                    "revenuePerDay" as revenue_per_day,
+                    "totalRefundAmount" as total_refund_amount,
+                    "totalRefundCount" as total_refund_count,
+                    "ordersWithRefunds" as orders_with_refunds,
+                    "etsyFeesRetainedOnRefunds" as etsy_fees_retained_on_refunds,
+                    "refundRateByOrder" as refund_rate_by_order,
+                    "refundRateByValue" as refund_rate_by_value,
+                    "orderRefundRate" as order_refund_rate,
+                    "cancelledOrders" as cancelled_orders,
+                    "cancellationRate" as cancellation_rate,
+                    "completionRate" as completion_rate,
+                    "primaryPaymentMethod" as primary_payment_method,
+                    "paymentMethodDiversity" as payment_method_diversity,
+                    "customerLifetimeValue" as customer_lifetime_value,
+                    "paybackPeriodDays" as payback_period_days,
+                    "customerAcquisitionCost" as customer_acquisition_cost,
+                    "priceElasticity" as price_elasticity,
+                    "peakMonth" as peak_month,
+                    "peakDayOfWeek" as peak_day_of_week,
+                    "peakHour" as peak_hour,
+                    "seasonalityIndex" as seasonality_index,
+                    "totalInventory" as total_inventory,
+                    "avgPrice" as avg_price,
+                    "priceRange" as price_range,
+                    "activeVariants" as active_variants,
+                    "inventoryTurnover" as inventory_turnover,
+                    "stockoutRisk" as stockout_risk,
+                    total_ad_spend,
+                    ad_spend_rate,
+                    roas
                 FROM product_reports
                 ORDER BY sku ASC
             """
@@ -1430,14 +1764,23 @@ class EcommerceAnalyticsOptimized:
                 # Convert PeriodType to string (from raw SQL result)
                 period_type = report['period_type'].lower()  # "YEARLY" -> "yearly"
                 
+                # Parse date strings to datetime objects if needed
+                from datetime import datetime
+                period_start = report['period_start']
+                period_end = report['period_end']
+                if isinstance(period_start, str):
+                    period_start = datetime.fromisoformat(period_start.replace('Z', '+00:00'))
+                if isinstance(period_end, str):
+                    period_end = datetime.fromisoformat(period_end.replace('Z', '+00:00'))
+                
                 # Create period_key in same format as calculate_metrics_batch
-                period_key = f"{report['period_start'].strftime('%Y-%m-%d')}_to_{report['period_end'].strftime('%Y-%m-%d')}"
+                period_key = f"{period_start.strftime('%Y-%m-%d')}_to_{period_end.strftime('%Y-%m-%d')}"
                 full_key = f"{period_type}_{period_key}"
                 
                 # Convert database record to metrics dict (snake_case from SQL)
                 metrics = {
-                    "period_start": report['period_start'],
-                    "period_end": report['period_end'],
+                    "period_start": period_start,
+                    "period_end": period_end,
                     "period_days": report['period_days'] or 0,
                     "gross_revenue": float(report['gross_revenue'] or 0),
                     "total_revenue": float(report['total_revenue'] or 0),
@@ -1723,14 +2066,17 @@ class EcommerceAnalyticsOptimized:
                 if skus:
                     return skus
             
-            # Query database if not in cache
-            listing_products = await self.prisma.listingproduct.find_many(
-                where={
-                    "listingId": listing_id,
-                    "isDeleted": False,
-                    "sku": {"not": None}
-                }
-            )
+            # Query database if not in cache (with retry on connection errors)
+            async def _query_listing_products():
+                return await self.prisma.listingproduct.find_many(
+                    where={
+                        "listingId": listing_id,
+                        "isDeleted": False,
+                        "sku": {"not": None}
+                    }
+                )
+            
+            listing_products = await self._retry_on_connection_error(_query_listing_products)
             
             skus = []
             for lp in listing_products:
@@ -1824,7 +2170,8 @@ class EcommerceAnalyticsOptimized:
                         ot.order_id,
                         ot.sku,
                         ot.quantity,
-                        ot.price
+                        ot.price,
+                        ot.listing_id
                     FROM order_transactions ot
                     INNER JOIN order_data od ON ot.order_id = od.order_id
                     {f"WHERE {entity_filter[4:]}" if entity_filter else ""}
@@ -1847,7 +2194,8 @@ class EcommerceAnalyticsOptimized:
                             json_build_object(
                                 'sku', td.sku,
                                 'quantity', td.quantity,
-                                'price', td.price
+                                'price', td.price,
+                                'listing_id', td.listing_id
                             )
                         ) FILTER (WHERE td.sku IS NOT NULL),
                         '[]'::json
@@ -1861,25 +2209,104 @@ class EcommerceAnalyticsOptimized:
                          od.status, od.payment_method, od.country, rd.refund_amount, rd.refund_count
             """
             
-            # Execute the mega-query with retry logic for timeouts
+            # Execute the mega-query with retry logic for timeouts and connection errors
             max_retries = 5
             for attempt in range(max_retries):
                 try:
+                    # Ensure connection before each attempt
+                    await self._ensure_connection()
                     raw_results = await self.prisma.query_raw(query)
                     break  # Success, exit retry loop
                 except Exception as query_error:
                     error_msg = str(query_error)
-                    if "statement timeout" in error_msg.lower() and attempt < max_retries - 1:
-                        logger.warning(f"Query timeout (attempt {attempt + 1}/{max_retries}), retrying with smaller batch...")
-                        # If timeout, try to simplify: skip this and return empty
-                        # This prevents the entire process from failing
-                        logger.error(f"Query timed out after multiple attempts. Skipping this batch.")
-                        empty_results = {}
-                        await asyncio.sleep(1)  # Brief pause before next attempt
-                        for dr in date_ranges:
-                            period_key = f"{dr.start_date.strftime('%Y-%m-%d')}_to_{dr.end_date.strftime('%Y-%m-%d')}"
-                            empty_results[period_key] = await self._empty_metrics(sku=sku, listing_id=listing_id, date_range=dr)
-                        return empty_results
+                    error_type = type(query_error).__name__
+                    
+                    # Check for connection errors (comprehensive detection)
+                    is_connection_error = (
+                        # Prisma-specific errors
+                        "Can't reach database server" in error_msg or
+                        "ClientNotConnectedError" in error_type or
+                        "not connected" in error_msg.lower() or
+                        "already connected" in error_msg.lower() or
+                        
+                        # PostgreSQL errors
+                        "Connection" in error_msg or
+                        "Closed" in error_msg or
+                        "connection refused" in error_msg.lower() or
+                        "connection reset" in error_msg.lower() or
+                        "connection timed out" in error_msg.lower() or
+                        "connection lost" in error_msg.lower() or
+                        "connection aborted" in error_msg.lower() or
+                        "connection closed" in error_msg.lower() or
+                        "broken pipe" in error_msg.lower() or
+                        
+                        # Network errors
+                        "ConnectError" in error_type or  # httpcore.ConnectError
+                        "NetworkError" in error_type or
+                        "TimeoutError" in error_type or
+                        "OSError" in error_type or
+                        "socket" in error_msg.lower() or
+                        "All connection attempts failed" in error_msg or
+                        
+                        # Server errors
+                        "server closed the connection" in error_msg.lower() or
+                        "server is not responding" in error_msg.lower() or
+                        "too many connections" in error_msg.lower() or
+                        "pool exhausted" in error_msg.lower() or
+                        
+                        # SSL/TLS errors
+                        "ssl" in error_msg.lower() or
+                        "tls" in error_msg.lower() or
+                        "certificate" in error_msg.lower()
+                    )
+                    
+                    if is_connection_error:
+                        if attempt < max_retries - 1:
+                            logger.warning(
+                                f"Database connection error: {error_type} (attempt {attempt + 1}/{max_retries}), "
+                                f"reconnecting in {2 ** attempt}s..."
+                            )
+                            await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                            
+                            # Force reconnection
+                            try:
+                                # First, disconnect if currently connected
+                                if self.prisma.is_connected():
+                                    await self.prisma.disconnect()
+                                    logger.debug("Disconnected stale connection")
+                            except Exception as disconnect_error:
+                                logger.debug(f"Error during disconnect: {disconnect_error}")
+                            
+                            # Now reconnect (only if not already connected)
+                            try:
+                                if not self.prisma.is_connected():
+                                    await self.prisma.connect()
+                                    await self.prisma.execute_raw("SET statement_timeout = '300000'")
+                                    self._last_connection_check = 0  # Reset check timestamp
+                                    logger.info("✓ Reconnected to database")
+                                else:
+                                    logger.debug("Connection already established, skipping reconnect")
+                            except Exception as reconnect_error:
+                                logger.error(f"Reconnection failed: {reconnect_error}")
+                            
+                            continue
+                        else:
+                            logger.error(f"Database connection failed after {max_retries} attempts")
+                            raise
+                    
+                    # Check for timeouts
+                    elif "statement timeout" in error_msg.lower():
+                        if attempt < max_retries - 1:
+                            logger.warning(f"Query timeout (attempt {attempt + 1}/{max_retries}), retrying...")
+                            await asyncio.sleep(1)
+                            continue
+                        else:
+                            logger.error(f"Query timed out after {max_retries} attempts. Skipping this batch.")
+                            empty_results = {}
+                            for dr in date_ranges:
+                                period_key = f"{dr.start_date.strftime('%Y-%m-%d')}_to_{dr.end_date.strftime('%Y-%m-%d')}"
+                                empty_results[period_key] = await self._empty_metrics(sku=sku, listing_id=listing_id, date_range=dr)
+                            return empty_results
                     else:
                         logger.error(f"SQL Query failed: {query_error}")
                         logger.error(f"Query was: {query[:500]}...")  # Log first 500 chars of query
@@ -2646,126 +3073,223 @@ class EcommerceAnalyticsOptimized:
             logger.error(f"Error in bulk save: {e}")
 
     async def _bulk_upsert_shop_reports(self, batch: List[Tuple[str, Dict]]):
-        """Bulk upsert shop reports using raw SQL."""
-        try:
-            # Build VALUES clause
-            values = []
-            for period_type, period_start, period_end, metrics in batch:
-                period_type_enum = period_type.upper()
-                m = metrics
-                values.append(f"""(
-                    '{period_type_enum}',
-                    '{period_start.isoformat()}',
-                    '{period_end.isoformat()}',
-                    {m.get('period_days', 0)},
-                    {m.get('total_revenue', 0)},
-                    {m.get('product_revenue', 0)},
-                    {m.get('total_shipping_revenue', 0)},
-                    {m.get('total_cost', 0)},
-                    {m.get('gross_profit', 0)},
-                    {m.get('net_profit', 0)},
-                    {m.get('total_orders', 0)},
-                    {m.get('total_items', 0)},
-                    {m.get('unique_customers', 0)}
-                )""")
-            
-            # Use ON CONFLICT DO UPDATE for upsert
-            query = f"""
-                INSERT INTO shop_reports (
-                    period_type, period_start, period_end, period_days,
-                    total_revenue, product_revenue, total_shipping_revenue,
-                    total_cost, gross_profit, net_profit,
-                    total_orders, total_items, unique_customers
-                ) VALUES {','.join(values)}
-                ON CONFLICT (period_type, period_start, period_end)
-                DO UPDATE SET
-                    total_revenue = EXCLUDED.total_revenue,
-                    product_revenue = EXCLUDED.product_revenue,
-                    total_orders = EXCLUDED.total_orders,
-                    updated_at = NOW()
-            """
-            
-            await self.prisma.execute_raw(query)
-        except Exception as e:
-            logger.error(f"Error in bulk upsert shop reports: {e}")
-            # Fallback to individual saves
-            for item in batch:
-                try:
-                    await self.save_shop_report(*item)
-                except:
-                    pass
+        """
+        Bulk upsert shop reports using raw SQL with comprehensive error handling.
+        Includes automatic retry logic and graceful fallback to individual saves.
+        """
+        if not batch:
+            return
+        
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                # Ensure connection before batch operation
+                await self._ensure_connection()
+                
+                # Build VALUES clause with proper escaping
+                values = []
+                for period_type, period_start, period_end, metrics in batch:
+                    period_type_enum = period_type.upper()
+                    m = metrics
+                    
+                    # Clean and validate all numeric values
+                    period_days = self._clean_metric_value(m.get('period_days', 0))
+                    total_revenue = self._clean_metric_value(m.get('total_revenue', 0))
+                    product_revenue = self._clean_metric_value(m.get('product_revenue', 0))
+                    total_shipping_revenue = self._clean_metric_value(m.get('total_shipping_revenue', 0))
+                    total_cost = self._clean_metric_value(m.get('total_cost', 0))
+                    gross_profit = self._clean_metric_value(m.get('gross_profit', 0))
+                    net_profit = self._clean_metric_value(m.get('net_profit', 0))
+                    total_orders = int(m.get('total_orders', 0))
+                    total_items = int(m.get('total_items', 0))
+                    unique_customers = int(m.get('unique_customers', 0))
+                    
+                    values.append(f"""(
+                        '{period_type_enum}',
+                        '{period_start.isoformat()}',
+                        '{period_end.isoformat()}',
+                        {period_days},
+                        {total_revenue},
+                        {product_revenue},
+                        {total_shipping_revenue},
+                        {total_cost},
+                        {gross_profit},
+                        {net_profit},
+                        {total_orders},
+                        {total_items},
+                        {unique_customers}
+                    )""")
+                
+                # Use ON CONFLICT DO UPDATE for upsert
+                query = f"""
+                    INSERT INTO shop_reports (
+                        period_type, period_start, period_end, period_days,
+                        total_revenue, product_revenue, total_shipping_revenue,
+                        total_cost, gross_profit, net_profit,
+                        total_orders, total_items, unique_customers
+                    ) VALUES {','.join(values)}
+                    ON CONFLICT (period_type, period_start, period_end)
+                    DO UPDATE SET
+                        period_days = EXCLUDED.period_days,
+                        total_revenue = EXCLUDED.total_revenue,
+                        product_revenue = EXCLUDED.product_revenue,
+                        total_shipping_revenue = EXCLUDED.total_shipping_revenue,
+                        total_cost = EXCLUDED.total_cost,
+                        gross_profit = EXCLUDED.gross_profit,
+                        net_profit = EXCLUDED.net_profit,
+                        total_orders = EXCLUDED.total_orders,
+                        total_items = EXCLUDED.total_items,
+                        unique_customers = EXCLUDED.unique_customers,
+                        updated_at = NOW()
+                """
+                
+                await self.prisma.execute_raw(query)
+                logger.debug(f"✓ Bulk saved {len(batch)} shop reports")
+                return  # Success!
+                
+            except Exception as e:
+                error_str = str(e)
+                error_type = type(e).__name__
+                
+                # Check if it's a connection error
+                is_connection_error = (
+                    "Can't reach database server" in error_str or
+                    "Connection" in error_str or
+                    "not connected" in error_str.lower() or
+                    "ClientNotConnectedError" in error_type or
+                    "ConnectError" in error_type or
+                    "Closed" in error_str or
+                    "broken pipe" in error_str.lower() or
+                    "connection refused" in error_str.lower()
+                )
+                
+                if is_connection_error and attempt < max_retries - 1:
+                    logger.warning(
+                        f"Connection error in bulk shop report save "
+                        f"(attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                else:
+                    # Final attempt failed or non-connection error - fallback to individual saves
+                    logger.error(
+                        f"⚠️  Bulk shop report save failed after {attempt + 1} attempts: {error_type}"
+                    )
+                    logger.info(f"Falling back to individual saves for {len(batch)} shop reports...")
+                    
+                    # Fallback: Save each report individually with error handling
+                    success_count = 0
+                    fail_count = 0
+                    
+                    for item in batch:
+                        try:
+                            await self._retry_on_connection_error(
+                                self.save_shop_report,
+                                *item
+                            )
+                            success_count += 1
+                        except Exception as individual_error:
+                            fail_count += 1
+                            logger.error(
+                                f"Failed to save individual shop report: {individual_error}"
+                            )
+                    
+                    logger.info(
+                        f"Individual save results: {success_count} succeeded, {fail_count} failed"
+                    )
+                    return  # Don't retry the entire batch again
 
     async def _bulk_upsert_listing_reports(self, batch: List[Tuple[str, Dict]]):
-        """Bulk upsert listing reports using Prisma ORM."""
-        try:
-            # Use Prisma's upsert for each report
-            for period_type, metrics in batch:
-                period_type_enum = {
-                    "yearly": PeriodType.YEARLY,
-                    "monthly": PeriodType.MONTHLY,
-                    "weekly": PeriodType.WEEKLY
-                }[period_type]
+        """
+        Bulk upsert listing reports using Prisma ORM with comprehensive error handling.
+        Includes automatic retry logic and graceful fallback to individual saves.
+        """
+        if not batch:
+            return
+        
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                # Ensure connection before batch operation
+                await self._ensure_connection()
                 
-                listing_id = metrics.get('listing_id')
-                if not listing_id:
-                    continue
-                    
-                period_start = metrics['period_start']
-                period_end = metrics['period_end']
+                success_count = 0
+                fail_count = 0
                 
-                await self.prisma.listingreport.upsert(
-                    where={
-                        'listingId_periodType_periodStart_periodEnd': {
-                            'listingId': int(listing_id),
-                            'periodType': period_type_enum,
-                            'periodStart': period_start,
-                            'periodEnd': period_end
-                        }
-                    },
-                    data={
-                        'create': {
-                            'listingId': int(listing_id),
-                            'periodType': period_type_enum,
-                            'periodStart': period_start,
-                            'periodEnd': period_end,
-                            'periodDays': metrics.get('period_days', 0),
-                            'grossRevenue': self._clean_metric_value(metrics.get('gross_revenue', 0)),
-                            'totalRevenue': self._clean_metric_value(metrics.get('total_revenue', 0)),
-                            'productRevenue': self._clean_metric_value(metrics.get('product_revenue', 0)),
-                            'totalShippingRevenue': self._clean_metric_value(metrics.get('total_shipping_revenue', 0)),
-                            'totalShippingCharged': self._clean_metric_value(metrics.get('total_shipping_charged', 0)),
-                            'actualShippingCost': self._clean_metric_value(metrics.get('actual_shipping_cost', 0)),
-                            'shippingProfit': self._clean_metric_value(metrics.get('shipping_profit', 0)),
-                            'dutyAmount': self._clean_metric_value(metrics.get('duty_amount', 0)),
-                            'taxAmount': self._clean_metric_value(metrics.get('tax_amount', 0)),
-                            'fedexProcessingFee': self._clean_metric_value(metrics.get('fedex_processing_fee', 0)),
-                            'totalTaxCollected': self._clean_metric_value(metrics.get('total_tax_collected', 0)),
-                            'totalVatCollected': self._clean_metric_value(metrics.get('total_vat_collected', 0)),
-                            'totalGiftWrapRevenue': self._clean_metric_value(metrics.get('total_gift_wrap_revenue', 0)),
-                            'totalDiscountsGiven': self._clean_metric_value(metrics.get('total_discounts_given', 0)),
-                            'etsyTransactionFees': self._clean_metric_value(metrics.get('etsy_transaction_fees', 0)),
-                            'etsyProcessingFees': self._clean_metric_value(metrics.get('etsy_processing_fees', 0)),
-                            'totalEtsyFees': self._clean_metric_value(metrics.get('total_etsy_fees', 0)),
-                            'etsyFeeRate': self._clean_metric_value(metrics.get('etsy_fee_rate', 0)),
-                            'netRevenue': self._clean_metric_value(metrics.get('net_revenue', 0)),
-                            'netRevenueAfterRefunds': self._clean_metric_value(metrics.get('net_revenue_after_refunds', 0)),
-                            'takeHomeRate': self._clean_metric_value(metrics.get('take_home_rate', 0)),
-                            'discountRate': self._clean_metric_value(metrics.get('discount_rate', 0)),
-                            'contributionMargin': self._clean_metric_value(metrics.get('contribution_margin', 0)),
-                            'totalCost': self._clean_metric_value(metrics.get('total_cost', 0)),
-                            'totalCostWithShipping': self._clean_metric_value(metrics.get('total_cost_with_shipping', 0)),
-                            'avgCostPerItem': self._clean_metric_value(metrics.get('avg_cost_per_item', 0)),
-                            'costPerOrder': self._clean_metric_value(metrics.get('cost_per_order', 0)),
-                            'grossProfit': self._clean_metric_value(metrics.get('gross_profit', 0)),
-                            'grossMargin': self._clean_metric_value(metrics.get('gross_margin', 0)),
-                            'netProfit': self._clean_metric_value(metrics.get('net_profit', 0)),
-                            'netMargin': self._clean_metric_value(metrics.get('net_margin', 0)),
-                            'returnOnRevenue': self._clean_metric_value(metrics.get('return_on_revenue', 0)),
-                            'markupRatio': self._clean_metric_value(metrics.get('markup_ratio', 0)),
-                            'totalOrders': metrics.get('total_orders', 0),
-                            'totalItems': metrics.get('total_items', 0),
-                            'totalQuantitySold': metrics.get('total_quantity_sold', 0),
-                            'uniqueSkus': metrics.get('unique_skus', 0),
+                # Use Prisma's upsert for each report
+                for period_type, metrics in batch:
+                    try:
+                        period_type_enum = {
+                            "yearly": PeriodType.YEARLY,
+                            "monthly": PeriodType.MONTHLY,
+                            "weekly": PeriodType.WEEKLY
+                        }[period_type]
+                        
+                        listing_id = metrics.get('listing_id')
+                        if not listing_id:
+                            continue
+                            
+                        period_start = metrics['period_start']
+                        period_end = metrics['period_end']
+                        
+                        await self.prisma.listingreport.upsert(
+                            where={
+                                'listingId_periodType_periodStart_periodEnd': {
+                                    'listingId': int(listing_id),
+                                    'periodType': period_type_enum,
+                                    'periodStart': period_start,
+                                    'periodEnd': period_end
+                                }
+                            },
+                            data={
+                                'create': {
+                                    'listingId': int(listing_id),
+                                    'periodType': period_type_enum,
+                                    'periodStart': period_start,
+                                    'periodEnd': period_end,
+                                    'periodDays': metrics.get('period_days', 0),
+                                    'grossRevenue': self._clean_metric_value(metrics.get('gross_revenue', 0)),
+                                    'totalRevenue': self._clean_metric_value(metrics.get('total_revenue', 0)),
+                                    'productRevenue': self._clean_metric_value(metrics.get('product_revenue', 0)),
+                                    'totalShippingRevenue': self._clean_metric_value(metrics.get('total_shipping_revenue', 0)),
+                                    'totalShippingCharged': self._clean_metric_value(metrics.get('total_shipping_charged', 0)),
+                                    'actualShippingCost': self._clean_metric_value(metrics.get('actual_shipping_cost', 0)),
+                                    'shippingProfit': self._clean_metric_value(metrics.get('shipping_profit', 0)),
+                                    'dutyAmount': self._clean_metric_value(metrics.get('duty_amount', 0)),
+                                    'taxAmount': self._clean_metric_value(metrics.get('tax_amount', 0)),
+                                    'fedexProcessingFee': self._clean_metric_value(metrics.get('fedex_processing_fee', 0)),
+                                    'totalTaxCollected': self._clean_metric_value(metrics.get('total_tax_collected', 0)),
+                                    'totalVatCollected': self._clean_metric_value(metrics.get('total_vat_collected', 0)),
+                                    'totalGiftWrapRevenue': self._clean_metric_value(metrics.get('total_gift_wrap_revenue', 0)),
+                                    'totalDiscountsGiven': self._clean_metric_value(metrics.get('total_discounts_given', 0)),
+                                    'etsyTransactionFees': self._clean_metric_value(metrics.get('etsy_transaction_fees', 0)),
+                                    'etsyProcessingFees': self._clean_metric_value(metrics.get('etsy_processing_fees', 0)),
+                                    'totalEtsyFees': self._clean_metric_value(metrics.get('total_etsy_fees', 0)),
+                                    'etsyFeeRate': self._clean_metric_value(metrics.get('etsy_fee_rate', 0)),
+                                    'netRevenue': self._clean_metric_value(metrics.get('net_revenue', 0)),
+                                    'netRevenueAfterRefunds': self._clean_metric_value(metrics.get('net_revenue_after_refunds', 0)),
+                                    'takeHomeRate': self._clean_metric_value(metrics.get('take_home_rate', 0)),
+                                    'discountRate': self._clean_metric_value(metrics.get('discount_rate', 0)),
+                                    'contributionMargin': self._clean_metric_value(metrics.get('contribution_margin', 0)),
+                                    'totalCost': self._clean_metric_value(metrics.get('total_cost', 0)),
+                                    'totalCostWithShipping': self._clean_metric_value(metrics.get('total_cost_with_shipping', 0)),
+                                    'avgCostPerItem': self._clean_metric_value(metrics.get('avg_cost_per_item', 0)),
+                                    'costPerOrder': self._clean_metric_value(metrics.get('cost_per_order', 0)),
+                                    'grossProfit': self._clean_metric_value(metrics.get('gross_profit', 0)),
+                                    'grossMargin': self._clean_metric_value(metrics.get('gross_margin', 0)),
+                                    'netProfit': self._clean_metric_value(metrics.get('net_profit', 0)),
+                                    'netMargin': self._clean_metric_value(metrics.get('net_margin', 0)),
+                                    'returnOnRevenue': self._clean_metric_value(metrics.get('return_on_revenue', 0)),
+                                    'markupRatio': self._clean_metric_value(metrics.get('markup_ratio', 0)),
+                                    'totalOrders': metrics.get('total_orders', 0),
+                                    'totalItems': metrics.get('total_items', 0),
+                                    'totalQuantitySold': metrics.get('total_quantity_sold', 0),
+                                    'uniqueSkus': metrics.get('unique_skus', 0),
                             'averageOrderValue': self._clean_metric_value(metrics.get('average_order_value', 0)),
                             'medianOrderValue': self._clean_metric_value(metrics.get('median_order_value', 0)),
                             'percentile75OrderValue': self._clean_metric_value(metrics.get('percentile_75_order_value', 0)),
@@ -2837,22 +3361,45 @@ class EcommerceAnalyticsOptimized:
                         }
                     }
                 )
-        except Exception as e:
-            logger.error(f"Error in bulk upsert listing reports: {e}")
-            # Fallback to individual saves
-            for period_type, metrics in batch:
-                try:
-                    listing_id = metrics.get('listing_id')
-                    if listing_id:
-                        await self.save_listing_report(
-                            int(listing_id),
-                            metrics,
-                            period_type,
-                            metrics['period_start'],
-                            metrics['period_end']
-                        )
-                except Exception as ex:
-                    logger.error(f"Failed to save listing report {listing_id}: {ex}")
+                        success_count += 1
+                    except Exception as item_error:
+                        fail_count += 1
+                        logger.error(f"Failed to save listing report {listing_id}: {item_error}")
+                
+                # Log batch results
+                logger.debug(f"✓ Bulk listing reports: {success_count} succeeded, {fail_count} failed")
+                return  # Success (with possible partial failures)
+                
+            except Exception as e:
+                error_str = str(e)
+                error_type = type(e).__name__
+                
+                # Check if it's a connection error
+                is_connection_error = (
+                    "Can't reach database server" in error_str or
+                    "Connection" in error_str or
+                    "not connected" in error_str.lower() or
+                    "ClientNotConnectedError" in error_type or
+                    "ConnectError" in error_type or
+                    "Closed" in error_str or
+                    "broken pipe" in error_str.lower() or
+                    "connection refused" in error_str.lower()
+                )
+                
+                if is_connection_error and attempt < max_retries - 1:
+                    logger.warning(
+                        f"Connection error in bulk listing report save "
+                        f"(attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                else:
+                    # Final attempt failed - log and continue
+                    logger.error(
+                        f"⚠️  Bulk listing report save failed after {attempt + 1} attempts: {error_type}"
+                    )
+                    return  # Don't crash, allow processing to continue
 
     async def _bulk_upsert_product_reports(self, batch: List[Tuple[str, Dict]]):
         """Bulk upsert product reports using Prisma ORM."""
@@ -3021,6 +3568,9 @@ class EcommerceAnalyticsOptimized:
                               period_start: datetime, period_end: datetime) -> None:
         """Save shop report to database (optimized single insert)."""
         try:
+            # Ensure database connection is healthy
+            await self._ensure_connection()
+            
             # Map period_type string to enum (same as reportsv3.py)
             period_type_enum = {
                 "yearly": PeriodType.YEARLY,
@@ -3121,19 +3671,24 @@ class EcommerceAnalyticsOptimized:
                 "stockoutRisk": self._clean_metric_value(metrics.get("stockout_risk", 0)),
             }
             
-            await self.prisma.shopreport.upsert(
-                where={
-                    "periodType_periodStart_periodEnd": {
-                        "periodType": period_type_enum,
-                        "periodStart": period_start,
-                        "periodEnd": period_end,
+            # Wrap upsert with connection retry logic
+            async def _upsert_shop_report():
+                return await self.prisma.shopreport.upsert(
+                    where={
+                        "periodType_periodStart_periodEnd": {
+                            "periodType": period_type_enum,
+                            "periodStart": period_start,
+                            "periodEnd": period_end,
+                        }
+                    },
+                    data={
+                        "create": payload,
+                        "update": payload
                     }
-                },
-                data={
-                    "create": payload,
-                    "update": payload
-                }
-            )
+                )
+            
+            await self._retry_on_connection_error(_upsert_shop_report)
+            
         except Exception as e:
             logger.error(f"Error saving shop report for {period_type} {period_start}-{period_end}: {e}", exc_info=True)
             raise  # Re-raise to see the full error
@@ -3148,9 +3703,10 @@ class EcommerceAnalyticsOptimized:
         period_end: datetime
     ) -> None:
         """
-        Save listing report AND all product reports in parallel for better performance.
+        Save listing report AND all product reports in parallel with comprehensive error handling.
         
         This ensures data consistency and faster saves by batching all related reports.
+        Includes automatic retry logic for connection errors and graceful degradation.
         
         Args:
             listing_id: The listing ID
@@ -3160,53 +3716,143 @@ class EcommerceAnalyticsOptimized:
             period_start: Start datetime of the period
             period_end: End datetime of the period
         """
-        try:
-            # Prepare all save tasks
-            save_tasks = []
-            
-            # Add listing report save task
-            save_tasks.append(
-                self.save_listing_report(
-                    listing_id, listing_metrics, period_type,
-                    period_start, period_end
-                )
-            )
-            
-            # Add all product report save tasks
-            for sku, product_metrics in product_metrics_list:
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                # Ensure connection is healthy before batch operation
+                await self._ensure_connection()
+                
+                # Prepare all save tasks
+                save_tasks = []
+                
+                # Add listing report save task (wrapped in retry logic)
                 save_tasks.append(
-                    self.save_product_report(
-                        sku, product_metrics, period_type,
+                    self._retry_on_connection_error(
+                        self.save_listing_report,
+                        listing_id, listing_metrics, period_type,
                         period_start, period_end
                     )
                 )
-            
-            # Execute all saves in parallel
-            results = await asyncio.gather(*save_tasks, return_exceptions=True)
-            
-            # Check for any errors
-            errors = [r for r in results if isinstance(r, Exception)]
-            if errors:
-                logger.error(
-                    f"Errors saving reports for listing {listing_id}, period {period_type}: "
-                    f"{len(errors)} errors out of {len(save_tasks)} saves"
-                )
-                for error in errors[:3]:  # Log first 3 errors
-                    logger.error(f"  - {error}")
-            else:
-                logger.debug(
-                    f"✓ Saved listing {listing_id} + {len(product_metrics_list)} products "
-                    f"for {period_type} period"
+                
+                # Add all product report save tasks (each wrapped in retry logic)
+                for sku, product_metrics in product_metrics_list:
+                    save_tasks.append(
+                        self._retry_on_connection_error(
+                            self.save_product_report,
+                            sku, product_metrics, period_type,
+                            period_start, period_end
+                        )
+                    )
+                
+                # Execute all saves in parallel with exception handling
+                results = await asyncio.gather(*save_tasks, return_exceptions=True)
+                
+                # Check for any errors
+                errors = [r for r in results if isinstance(r, Exception)]
+                if errors:
+                    # Check if errors are connection-related
+                    connection_errors = []
+                    other_errors = []
+                    
+                    for error in errors:
+                        error_str = str(error)
+                        error_type = type(error).__name__
+                        
+                        is_connection_error = (
+                            "Can't reach database server" in error_str or
+                            "Connection" in error_str or
+                            "not connected" in error_str.lower() or
+                            "ClientNotConnectedError" in error_type or
+                            "ConnectError" in error_type or
+                            "Closed" in error_str or
+                            "broken pipe" in error_str.lower() or
+                            "connection refused" in error_str.lower()
+                        )
+                        
+                        if is_connection_error:
+                            connection_errors.append(error)
+                        else:
+                            other_errors.append(error)
+                    
+                    # If we have connection errors and retries left, retry entire batch
+                    if connection_errors and attempt < max_retries - 1:
+                        logger.warning(
+                            f"Connection errors in batch save for listing {listing_id} "
+                            f"(attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s..."
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    
+                    # Log errors but don't fail the entire batch
+                    logger.error(
+                        f"⚠️  Partial save failure for listing {listing_id}, period {period_type}: "
+                        f"{len(errors)} errors out of {len(save_tasks)} saves"
+                    )
+                    
+                    if connection_errors:
+                        logger.error(f"  Connection errors: {len(connection_errors)}")
+                        for error in connection_errors[:2]:
+                            logger.error(f"    - {error}")
+                    
+                    if other_errors:
+                        logger.error(f"  Other errors: {len(other_errors)}")
+                        for error in other_errors[:2]:
+                            logger.error(f"    - {error}")
+                    
+                    # Success if at least listing report was saved
+                    successful_saves = len(save_tasks) - len(errors)
+                    logger.info(
+                        f"  ✓ Successfully saved {successful_saves}/{len(save_tasks)} reports "
+                        f"for listing {listing_id}"
+                    )
+                else:
+                    logger.debug(
+                        f"✓ Saved listing {listing_id} + {len(product_metrics_list)} products "
+                        f"for {period_type} period"
+                    )
+                
+                # If we get here, batch completed (with or without partial errors)
+                return
+                
+            except Exception as e:
+                error_str = str(e)
+                error_type = type(e).__name__
+                
+                # Check if it's a connection error
+                is_connection_error = (
+                    "Can't reach database server" in error_str or
+                    "Connection" in error_str or
+                    "not connected" in error_str.lower() or
+                    "ClientNotConnectedError" in error_type or
+                    "ConnectError" in error_type or
+                    "Closed" in error_str
                 )
                 
-        except Exception as e:
-            logger.error(f"Error in batch save for listing {listing_id}: {e}")
-            raise
+                if is_connection_error and attempt < max_retries - 1:
+                    logger.warning(
+                        f"Connection error in batch save for listing {listing_id} "
+                        f"(attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                else:
+                    logger.error(
+                        f"❌ Failed to save reports for listing {listing_id} after {attempt + 1} attempts: {e}"
+                    )
+                    # Don't raise - allow processing to continue with other listings
+                    return
 
     async def save_listing_report(self, listing_id: int, metrics: Dict, period_type: str,
                                  period_start: datetime, period_end: datetime) -> None:
         """Save listing report to database."""
         try:
+            # Ensure database connection is healthy
+            await self._ensure_connection()
+            
             # Map period_type string to enum (same as reportsv3.py)
             period_type_enum = {
                 "yearly": PeriodType.YEARLY,
@@ -3325,20 +3971,25 @@ class EcommerceAnalyticsOptimized:
                 "roas": self._clean_metric_value(metrics.get("roas", 0)),
             }
             
-            await self.prisma.listingreport.upsert(
-                where={
-                    "listingId_periodType_periodStart_periodEnd": {
-                        "listingId": listing_id,
-                        "periodType": period_type_enum,
-                        "periodStart": period_start,
-                        "periodEnd": period_end,
+            # Wrap upsert with connection retry logic
+            async def _upsert_listing_report():
+                return await self.prisma.listingreport.upsert(
+                    where={
+                        "listingId_periodType_periodStart_periodEnd": {
+                            "listingId": listing_id,
+                            "periodType": period_type_enum,
+                            "periodStart": period_start,
+                            "periodEnd": period_end,
+                        }
+                    },
+                    data={
+                        "create": payload,
+                        "update": payload
                     }
-                },
-                data={
-                    "create": payload,
-                    "update": payload
-                }
-            )
+                )
+            
+            await self._retry_on_connection_error(_upsert_listing_report)
+            
         except Exception as e:
             logger.error(f"Error saving listing report for listing {listing_id}, {period_type} {period_start}-{period_end}: {e}", exc_info=True)
 
@@ -3346,6 +3997,9 @@ class EcommerceAnalyticsOptimized:
                                  period_start: datetime, period_end: datetime) -> None:
         """Save product report to database."""
         try:
+            # Ensure database connection is healthy
+            await self._ensure_connection()
+            
             # Map period_type string to enum (same as reportsv3.py)
             period_type_enum = {
                 "yearly": PeriodType.YEARLY,
@@ -3445,22 +4099,30 @@ class EcommerceAnalyticsOptimized:
                 "activeVariants": self._clean_metric_value(metrics.get("active_variants", 0)),
                 "inventoryTurnover": self._clean_metric_value(metrics.get("inventory_turnover", 0)),
                 "stockoutRisk": self._clean_metric_value(metrics.get("stockout_risk", 0)),
+                "totalAdSpend": self._clean_metric_value(metrics.get("total_ad_spend", 0)),
+                "adSpendRate": self._clean_metric_value(metrics.get("ad_spend_rate", 0)),
+                "roas": self._clean_metric_value(metrics.get("roas", 0)),
             }
             
-            await self.prisma.productreport.upsert(
-                where={
-                    "sku_periodType_periodStart_periodEnd": {
-                        "sku": sku,
-                        "periodType": period_type_enum,
-                        "periodStart": period_start,
-                        "periodEnd": period_end,
+            # Wrap upsert with connection retry logic
+            async def _upsert_product_report():
+                return await self.prisma.productreport.upsert(
+                    where={
+                        "sku_periodType_periodStart_periodEnd": {
+                            "sku": sku,
+                            "periodType": period_type_enum,
+                            "periodStart": period_start,
+                            "periodEnd": period_end,
+                        }
+                    },
+                    data={
+                        "create": payload,
+                        "update": payload
                     }
-                },
-                data={
-                    "create": payload,
-                    "update": payload
-                }
-            )
+                )
+            
+            await self._retry_on_connection_error(_upsert_product_report)
+            
         except Exception as e:
             logger.error(f"Error saving product report for SKU {sku}, {period_type} {period_start}-{period_end}: {e}", exc_info=True)
             
@@ -3522,8 +4184,17 @@ class EcommerceAnalyticsOptimized:
             sku_metrics_store = {}  # {sku: {period_key: metrics}}
             listing_metrics_store = {}  # {listing_id: {period_key: metrics}}
             
-            # Chunk size for processing
-            chunk_size = self.max_concurrent * 3  # Balanced for file descriptors
+            # Chunk size for processing - REDUCED for listings due to multiple queries per listing
+            # Each listing makes 3-5 database queries (get_child_skus, calculate_metrics, ad_spend, save)
+            # So we need much smaller chunks to avoid overwhelming the connection pool
+            sku_chunk_size = self.max_concurrent * 3  # SKUs: balanced for file descriptors
+            listing_chunk_size = max(5, self.max_concurrent // 4)  # Listings: MUCH smaller due to multiple DB calls per listing
+            
+            tqdm.write(f"🔧 Concurrency settings:")
+            tqdm.write(f"   max_concurrent: {self.max_concurrent}")
+            tqdm.write(f"   SKU chunk size: {sku_chunk_size}")
+            tqdm.write(f"   Listing chunk size: {listing_chunk_size} (reduced due to 3-5 DB queries per listing)")
+            tqdm.write(f"   Estimated peak DB connections: ~{listing_chunk_size * 5} for listings\n")
             
             # ==========================================
             # PHASE 1: PRODUCT/SKU REPORTS (BASE LEVEL)
@@ -3548,12 +4219,12 @@ class EcommerceAnalyticsOptimized:
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
                     colour='green'
                 ) as pbar:
-                    for i in range(0, len(sku_tasks), chunk_size):
-                        chunk = sku_tasks[i:i + chunk_size]
+                    for i in range(0, len(sku_tasks), sku_chunk_size):
+                        chunk = sku_tasks[i:i + sku_chunk_size]
                         await asyncio.gather(*chunk)
                         pbar.update(len(chunk))
                         # Small delay to prevent file descriptor exhaustion
-                        if len(chunk) == chunk_size:
+                        if len(chunk) == sku_chunk_size:
                             await asyncio.sleep(0.01)
                 
                 tqdm.write(f"✅ Completed {len(all_skus)} SKUs\n")
@@ -3575,6 +4246,12 @@ class EcommerceAnalyticsOptimized:
                     tqdm.write(f"   Sample periods: {sample_periods[:3] if len(sample_periods) > 3 else sample_periods}")
                 else:
                     tqdm.write("   ⚠️  WARNING: sku_metrics_store is EMPTY!")
+                    tqdm.write("   ❌ CRITICAL: Without SKU data, listing reports will be VERY SLOW!")
+                    tqdm.write("   Each listing will make ~200-400 database queries instead of using cached data.")
+                    tqdm.write("   Expected time: 30-120 seconds per listing × 811 listings = 7-27 hours!")
+                    tqdm.write("\n   💡 SOLUTION: Run without --skip-products to generate product reports first:")
+                    tqdm.write("      python reportsv4_optimized.py")
+                    tqdm.write("\n   Or if product reports exist in DB but failed to load, check database connection.")
                 tqdm.write("")
             
             # ==========================================
@@ -3602,13 +4279,14 @@ class EcommerceAnalyticsOptimized:
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
                     colour='blue'
                 ) as pbar:
-                    for i in range(0, len(listing_tasks), chunk_size):
-                        chunk = listing_tasks[i:i + chunk_size]
+                    for i in range(0, len(listing_tasks), listing_chunk_size):
+                        chunk = listing_tasks[i:i + listing_chunk_size]
                         await asyncio.gather(*chunk)
                         pbar.update(len(chunk))
-                        # Small delay to prevent file descriptor exhaustion
-                        if len(chunk) == chunk_size:
-                            await asyncio.sleep(0.01)
+                        # Longer delay for listings to prevent connection pool exhaustion
+                        # Each listing makes 3-5 database queries, so we need more breathing room
+                        if len(chunk) == listing_chunk_size:
+                            await asyncio.sleep(0.1)  # 100ms delay between chunks
                 
                 tqdm.write(f"✅ Completed {len(all_listings)} listings\n")
             else:
@@ -3637,7 +4315,13 @@ class EcommerceAnalyticsOptimized:
                     )
                     shop_tasks.append(task)
                 
-                # Process with progress bar
+                tqdm.write(f"   Processing {len(shop_tasks)} report types (yearly, monthly, weekly)")
+                tqdm.write(f"   Note: Shop reports aggregate from all listings, queries may be large")
+                tqdm.write(f"   Processing SEQUENTIALLY to avoid overwhelming database\n")
+                
+                # Process with progress bar - shop reports MUST be processed SEQUENTIALLY
+                # Running them in parallel with asyncio.gather() would create too many DB connections!
+                # Each shop task processes all date ranges for that period type
                 with tqdm(
                     total=len(shop_tasks), 
                     desc="🏪 Processing Shop Reports",
@@ -3646,9 +4330,15 @@ class EcommerceAnalyticsOptimized:
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
                     colour='cyan'
                 ) as pbar:
-                    for task in shop_tasks:
+                    # IMPORTANT: Process sequentially, NOT in parallel!
+                    for i, task in enumerate(shop_tasks):
+                        period_name = ['Yearly', 'Monthly', 'Weekly'][i] if i < 3 else f'Period {i+1}'
+                        tqdm.write(f"   Processing {period_name} reports...")
                         await task
                         pbar.update(1)
+                        # Add delay between shop report types to prevent connection issues
+                        if i < len(shop_tasks) - 1:  # Don't delay after last one
+                            await asyncio.sleep(0.5)  # 500ms delay between report types
                 
                 tqdm.write(f"✅ Completed all shop reports\n")
             else:
@@ -3844,6 +4534,9 @@ class EcommerceAnalyticsOptimized:
         """
         async with semaphore:
             try:
+                # Ensure connection is healthy at start of listing processing
+                await self._ensure_connection()
+                
                 # Get child SKUs for aggregation
                 child_product_ids = self._listing_to_products.get(listing_id, [])
                 child_skus = []
@@ -3859,8 +4552,17 @@ class EcommerceAnalyticsOptimized:
                 listing_cache_store[listing_id] = {}
                 has_saved_any = False
                 
+                period_count = 0
+                direct_calc_count = 0  # Track how many times we fallback to direct calculation
+                
                 for period_type, date_ranges in periods.items():
                     for dr in date_ranges:
+                        # Periodic connection health check every 5 periods to prevent idle timeout
+                        # This is important because listings take ~125 seconds and DB may close idle connections
+                        period_count += 1
+                        if period_count % 5 == 0:
+                            await self._ensure_connection()
+                        
                         # CRITICAL: Use same format as calculate_metrics_batch returns
                         period_key = f"{dr.start_date.strftime('%Y-%m-%d')}_to_{dr.end_date.strftime('%Y-%m-%d')}"
                         full_key = f"{period_type}_{period_key}"
@@ -3870,7 +4572,17 @@ class EcommerceAnalyticsOptimized:
                         
                         # TRY 2: If aggregation returned nothing, calculate directly
                         # This will use the fallback cost strategy automatically
+                        # NOTE: This makes a database query and is SLOW - try to avoid!
                         if not aggregated_metrics or aggregated_metrics.get('total_orders', 0) == 0:
+                            direct_calc_count += 1
+                            
+                            # Warn if we're doing too many direct calculations (indicates missing SKU data)
+                            if direct_calc_count == 1:
+                                logger.debug(
+                                    f"Listing {listing_id}: Falling back to direct calculation "
+                                    f"(SKU metrics not found in cache for {', '.join(child_skus[:3])})"
+                                )
+                            
                             # Direct calculation for this listing
                             batch_metrics = await self.calculate_metrics_batch([dr], period_type=period_type, listing_id=listing_id)
                             if batch_metrics:
@@ -3913,6 +4625,13 @@ class EcommerceAnalyticsOptimized:
                 # Track listings that had no data at all
                 if not has_saved_any:
                     self._listings_skipped_no_cost.add(listing_id)
+                
+                # Warn if this listing required too many direct calculations (performance issue)
+                if direct_calc_count > period_count * 0.5:  # More than 50% of periods needed direct calc
+                    logger.warning(
+                        f"⚠️ Listing {listing_id} required {direct_calc_count}/{period_count} direct DB queries "
+                        f"(SKU metrics missing from cache). Consider using --skip-products=false to generate SKU reports first."
+                    )
                             
             except Exception as e:
                 logger.error(f"Error processing listing {listing_id}: {e}", exc_info=True)
@@ -3966,10 +4685,28 @@ class EcommerceAnalyticsOptimized:
                     # TRY 2: If aggregation failed or no data, calculate directly from transactions
                     if not aggregated_metrics or aggregated_metrics.get('total_orders', 0) == 0:
                         # Direct calculation for shop-level (all transactions)
-                        batch_metrics = await self.calculate_metrics_batch([dr], period_type=period_type)
-                        if batch_metrics:
-                            # Use the same period_key format that calculate_metrics_batch returns
-                            aggregated_metrics = batch_metrics.get(period_key)
+                        # This can be a VERY large query, so wrap with extra error handling
+                        try:
+                            batch_metrics = await self.calculate_metrics_batch([dr], period_type=period_type)
+                            if batch_metrics:
+                                # Use the same period_key format that calculate_metrics_batch returns
+                                aggregated_metrics = batch_metrics.get(period_key)
+                        except Exception as calc_error:
+                            error_msg = str(calc_error)
+                            if "timeout" in error_msg.lower() or "Can't reach" in error_msg:
+                                logger.error(
+                                    f"❌ Shop report calculation failed for {period_type} "
+                                    f"({dr.start_date.date()} to {dr.end_date.date()}): {calc_error}"
+                                )
+                                logger.error(
+                                    f"   This may be due to large dataset size. Consider:"
+                                    f"\n   1. Aggregating from listing reports instead (if available)"
+                                    f"\n   2. Increasing database timeout"
+                                    f"\n   3. Processing shorter time periods"
+                                )
+                                continue  # Skip this period and move to next
+                            else:
+                                raise  # Re-raise if not a timeout/connection error
                     
                     # Save if we have valid data AND non-zero cost
                     if aggregated_metrics and aggregated_metrics.get('total_orders', 0) > 0:
@@ -3995,6 +4732,8 @@ class EcommerceAnalyticsOptimized:
                             logger.info(
                                 f"✓ Saved Shop {period_type} report with ${total_cost:.2f} total cost"
                             )
+                            # Small delay between shop report saves to prevent connection pool stress
+                            await asyncio.sleep(0.1)
                         except Exception as save_error:
                             logger.error(f"Failed to save shop report: {save_error}", exc_info=True)
                 
